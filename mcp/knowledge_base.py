@@ -60,7 +60,7 @@ class KnowledgeBase:
         # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 知识库"},
+            metadata={"description": "MaxMind RAG 知识库"},
         )
 
         # 如果知识库为空，导入默认文档

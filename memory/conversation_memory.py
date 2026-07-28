@@ -26,7 +26,7 @@ from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
 
-
+# 枚举类，用来安全规范地表示“消息由谁发出”，且取值仅有固定的三种
 class MsgRole(Enum):
     USER      = "user"
     ASSISTANT = "assistant"
@@ -78,7 +78,7 @@ class MemoryManager:
     """
 
     WORKING_MAX   = 20    # 工作记忆最大条数，超过则触发压缩
-    COMPRESS_AT   = 15    # 达到此条数时压缩，保留摘要 + 最近 5 条
+    COMPRESS_AT   = 6    # 达到此条数时压缩，保留摘要 + 最近 5 条
     HISTORY_TOP_K = 5     # 情景记忆检索返回条数
 
     def __init__(
@@ -166,11 +166,7 @@ class MemoryManager:
             return
 
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
-        prompt = f"""从以下对话中提炼用户偏好和关键实体，返回 JSON。
-对话:
-{text}
-
-返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
+        prompt = f"""从以下对话中提炼用户偏好和关键实体，返回 JSON。对话:{text}返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
         prompt = self._safe_text(prompt)
 
         try:
@@ -209,28 +205,44 @@ class MemoryManager:
 
         query 用于从情景记忆中检索语义相关的历史片段。
         """
+        # ★ 记忆读取入口
+        print(f"[FLOW]   \u251c\u2500 读取三级记忆: user={user_id}, query=\"{query}\"")
         # 1. 工作记忆（当前会话最近消息）
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
-        query = self._safe_text(query)
+        query = self._safe_text(query) #用户输入的查询
 
         recent = await self._get_working_memory(user_id, conv_id)
+        print(f"[FLOW]   \u2502   \u251c\u2500 [工作记忆] {len(recent)} 条消息:")
+        for m in recent[-3:]:
+            print(f"[FLOW]   \u2502   \u2502   {m.role.value}: {m.content[:50]}")
+        if not recent:
+            print(f"[FLOW]   \u2502   \u2502   (空)")
 
         # 2. 情景记忆（跨会话语义检索）
         history = await self._search_episodic(user_id, query or (recent[-1].content if recent else ""))
+        print(f"[FLOW]   \u2502   \u251c\u2500 [情景记忆] {len(history)} 条相关历史:")
+        for h in history[:2]:
+            print(f"[FLOW]   \u2502   \u2502   - {h[:60]}")
+        if not history:
+            print(f"[FLOW]   \u2502   \u2502   (空)")
 
         # 3. 用户画像
         profile = await self._get_profile(user_id)
+        print(f"[FLOW]   \u2502   \u251c\u2500 [用户画像]: {json.dumps(profile, ensure_ascii=False)[:80] if profile else '(空)'}")
 
         # 4. 会话摘要（如果已压缩过）
         summary = self._redis.get(self._summary_key(user_id, conv_id)) or ""
 
-        return MemoryContext(
+        # 最终喂给 LLM 的完整记忆上下文
+        ctx = MemoryContext(
             recent_messages=recent,
             relevant_history=history,
             user_profile=profile,
             summary=summary,
         )
+        print(f"[FLOW]   \u2514\u2500 记忆上下文: {len(recent)}条近期消息, {len(history)}条相关历史, 画像={'\u6709' if profile else '\u65e0'}, 摘要={'\u6709' if summary else '\u65e0'}")
+        return ctx
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 

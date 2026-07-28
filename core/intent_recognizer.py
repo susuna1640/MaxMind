@@ -125,6 +125,8 @@ class IntentRecognizer:
 
         history 格式：[{"role": "user"/"assistant", "content": "..."}]
         """
+        # ★ 意图识别入口
+        print(f"[FLOW]   \u251c\u2500 意图识别开始: \"{message}\"")
         key = self._cache_key(message)
         if key in self._cache:
             self.cache_hits += 1
@@ -144,9 +146,15 @@ class IntentRecognizer:
             llm = await llm_task
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
+        # ★ 三路结果投票合并
+        print(f"[FLOW]   \u251c\u2500 三路结果:")
+        print(f"[FLOW]   \u2502   LLM:     {llm.get('intent', 'OTHER')} (置信度 {llm.get('confidence', 0):.2f})")
+        print(f"[FLOW]   \u2502   Embedding: {emb.get('intent', 'OTHER')} (置信度 {emb.get('confidence', 0):.2f})")
+        print(f"[FLOW]   \u2502   Pattern:   {pat.get('intent', 'OTHER')} (置信度 {pat.get('confidence', 0):.2f})")
         intent = self._vote(llm, emb, pat)
         entities = await self._extract_entities(message)
         urgency  = self._urgency(message, intent)
+        print(f"[FLOW]   \u2514\u2500 投票结果: intent={intent.value}, urgency={urgency.name}, 耗时 {(time.monotonic()-t0)*1000:.0f}ms")
 
         result = IntentResult(
             intent=intent,
@@ -209,6 +217,12 @@ class IntentRecognizer:
 可选意图: {", ".join(c.value for c in IntentCategory)}"""
         prompt = self._clean_text(prompt)
 
+        print(f"[FLOW]   \u2502   \u251c\u2500 [意图识别 Prompt] (发送给 LLM):")
+        for line in prompt.split('\n')[:8]:
+            print(f"[FLOW]   \u2502   \u2502   {line}")
+        if len(prompt.split('\n')) > 8:
+            print(f"[FLOW]   \u2502   \u2502   ... (共 {len(prompt.split(chr(10)))} 行)")
+
         try:
             resp = await self.client.messages.create(
                 model=self.model,
@@ -217,6 +231,7 @@ class IntentRecognizer:
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = resp.content[0].text
+            print(f"[FLOW]   \u2502   \u2514\u2500 [LLM 返回]: {raw[:100]}")
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
             try:

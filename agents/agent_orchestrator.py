@@ -145,13 +145,32 @@ class BaseAgent:
             messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
         messages.append({"role": "user", "content": _clean(req.message)})
 
+        system_prompt = self._build_system_prompt(req)
+
+        # ★ 显示发给 LLM 的完整内容
+        print(f"[FLOW]   \u2502   \u251c\u2500 [System Prompt] ({self.agent_type.value}Agent):")
+        for line in system_prompt.split('\n')[:5]:
+            print(f"[FLOW]   \u2502   \u2502   {line}")
+        if len(system_prompt.split('\n')) > 5:
+            print(f"[FLOW]   \u2502   \u2502   ... (共 {len(system_prompt.split(chr(10)))} 行)")
+        print(f"[FLOW]   \u2502   \u251c\u2500 [Messages] (共 {len(messages)} 条):")
+        for i, msg in enumerate(messages):
+            content_preview = msg['content'][:80].replace('\n', ' ')
+            print(f"[FLOW]   \u2502   \u2502   [{i+1}] {msg['role']}: {content_preview}...")
+
         resp = await self._client.messages.create(
             model=self._model,
             max_tokens=1024,
-            system=self._build_system_prompt(req),
+            system=system_prompt,
             messages=messages,
         )
-        return resp.content[0].text
+        result_text = resp.content[0].text
+        print(f"[FLOW]   \u2502   \u2514\u2500 [Agent LLM 返回] ({len(result_text)} 字):")
+        for line in result_text.split('\n')[:4]:
+            print(f"[FLOW]   \u2502       {line}")
+        if len(result_text.split('\n')) > 4:
+            print(f"[FLOW]   \u2502       ... (共 {len(result_text.split(chr(10)))} 行)")
+        return result_text
 
     def _build_system_prompt(self, req: Request) -> str:
         """把动态加载的 Skills 拼入 system prompt，让业务规则随请求生效。"""
@@ -171,7 +190,7 @@ class BaseAgent:
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
     system_prompt = (
-        "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
+        "你是 MaxMind 智能客服。友好、简洁地回答用户问题。"
         "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
     )
 
@@ -249,6 +268,8 @@ class AgentOrchestrator:
         处理一次请求的完整流程：
           意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
         """
+        # ★ 编排器主入口
+        print(f"[FLOW] Step 2/4: 编排器收到请求: \"{req.message}\"")
         t0 = time.monotonic()
 
         # 1. 意图识别（如果调用方已识别则跳过）
@@ -256,6 +277,7 @@ class AgentOrchestrator:
             intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
             req.intent  = intent_result.intent
             req.urgency = intent_result.urgency
+            print(f"[FLOW]   \u251c\u2500 意图识别完成: intent={req.intent.value}, urgency={req.urgency.name}")
 
         # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
         collaboration = self._collaboration_targets(req)
@@ -264,9 +286,12 @@ class AgentOrchestrator:
 
         # 2. 路由：选择 Agent 类型
         agent_type = self._route(req.intent, req.urgency)
+        print(f"[FLOW]   \u251c\u2500 路由决策: {req.intent.value} → {agent_type.value}Agent")
 
         # 3. 执行（含降级）
+        print(f"[FLOW]   \u251c\u2500 调用 {agent_type.value}Agent 处理...")
         response = await self._execute(req, agent_type)
+        print(f"[FLOW]   \u2514\u2500 Agent 返回: success={response.success}, 耗时 {response.latency_ms:.0f}ms")
 
         # 4. 升级检查
         escalated = False

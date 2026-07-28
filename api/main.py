@@ -1,5 +1,5 @@
 """
-EchoMind 智能客服系统 — FastAPI 入口
+MaxMind 智能客服系统 — FastAPI 入口
 
 启动时打印小熊饼干图案。
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 BANNER = r"""
     ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
    ╔══════════════════════╗
-   ║   EchoMind  v2.0     ║
+   ║   MaxMind  v2.0     ║
    ║   智能客服 AI 系统    ║
    ╚══════════════════════╝
     ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
@@ -92,10 +92,10 @@ async def lifespan(app: FastAPI):
     )
 
     # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
-    skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
+    skills_dir = os.getenv("MaxMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
     _skill_manager = SkillManager(
         root_dir=skills_dir,
-        max_prompt_chars=int(os.getenv("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+        max_prompt_chars=int(os.getenv("MAXMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
     )
     _skill_manager.load()
 
@@ -179,16 +179,16 @@ async def lifespan(app: FastAPI):
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
-    logger.info("EchoMind 已就绪")
+    logger.info("MaxMind 已就绪")
     yield
 
     await _monitor.stop()
-    logger.info("EchoMind 已关闭")
+    logger.info("MaxMind 已关闭")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="EchoMind 智能客服",
+    title="MaxMind 智能客服",
     version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs",
@@ -252,6 +252,9 @@ async def chat(req: ChatRequest):
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
     """
+    print(f"\n{'='*60}")
+    print(f"[FLOW] 收到请求: user={req.user_id}, message=\"{req.message}\"")
+    print(f"{'='*60}")
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
@@ -261,6 +264,7 @@ async def chat(req: ChatRequest):
     conv_id = req.conv_id or str(uuid.uuid4())
 
     # 1. 读取记忆上下文
+    print("[FLOW] Step 1/4: 读取三级记忆上下文...")
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
     # 2. 构建编排请求（含对话历史，用于意图识别上下文）
@@ -283,10 +287,26 @@ async def chat(req: ChatRequest):
         history=history,
     )
 
-    # 3. 执行
+    # 3. 执行（进入编排器：意图识别 → Agent 路由 → LLM 调用）
+    print(f"[FLOW] Step 3/4: 进入编排器...")
+    print(f"[FLOW]   \u251c\u2500 [完整 Context] (发给 Agent 的背景信息):")
+    if full_context:
+        for line in full_context.split('\n')[:6]:
+            print(f"[FLOW]   \u2502   {line}")
+        if len(full_context.split('\n')) > 6:
+            print(f"[FLOW]   \u2502   ... (共 {len(full_context.split(chr(10)))} 行)")
+    else:
+        print(f"[FLOW]   \u2502   (空)")
     result = await _orchestrator.run(orch_req)
 
     # 4. 写入记忆
+    print(f"[FLOW] Step 4/4: 写入记忆 (intent={result.intent.value}, agent={result.agent_type.value})")
+    print(f"[FLOW]   \u251c\u2500 [Agent 最终回复]:")
+    for line in result.response.split('\n')[:4]:
+        print(f"[FLOW]   \u2502   {line}")
+    if len(result.response.split('\n')) > 4:
+        print(f"[FLOW]   \u2502   ... (共 {len(result.response.split(chr(10)))} 行)")
+    print(f"[FLOW]   \u2514\u2500 总耗时: {result.latency_ms:.0f}ms, 升级: {result.escalated}")
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
     await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
@@ -548,7 +568,7 @@ async def run_eval(body: Optional[EvalRunInput] = None):
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────
 async def _cli():
     print(BANNER)
-    print("EchoMind CLI — 输入 quit 退出\n")
+    print("MaxMind CLI — 输入 quit 退出\n")
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from memory.conversation_memory import MemoryManager, MsgRole
@@ -556,8 +576,8 @@ async def _cli():
 
     cfg = _anthropic_cfg()
     skill_manager = SkillManager(
-        root_dir=os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
-        max_prompt_chars=int(os.getenv("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+        root_dir=os.getenv("MAXMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
+        max_prompt_chars=int(os.getenv("MAXMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
     )
     skill_manager.load()
     orch = AgentOrchestrator(
@@ -599,7 +619,7 @@ async def _cli():
         await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-        print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+        print(f"\nMaxMind [{result.agent_type.value}]: {result.response}\n")
 
 
 if __name__ == "__main__":
