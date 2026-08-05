@@ -1,4 +1,4 @@
-# MaxMind 智能客服系统 — Docker Compose 服务编排
+# HealthMind 个性化健康管理助手 — Docker Compose 服务编排
 # 三级记忆架构：Redis（工作记忆）+ ChromaDB（情景记忆 + 用户画像）
 
 services:
@@ -6,17 +6,17 @@ services:
   # ── Redis 缓存（工作记忆）────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    container_name: maxmind-redis
+    container_name: healthmind-redis
     ports:
       - "6379:6379"
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-maxmind123}
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-healthmind123}
     volumes:
       - redis-data:/data
     restart: unless-stopped
     networks:
-      - maxmind-network
+      - healthmind-network
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-maxmind123}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-healthmind123}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,7 +24,7 @@ services:
   # ── ChromaDB 向量数据库（情景记忆 + 用户画像）────────────────────────────────
   chromadb:
     image: chromadb/chroma:0.5.23
-    container_name: maxmind-chromadb
+    container_name: healthmind-chromadb
     ports:
       - "8001:8000"
     environment:
@@ -35,7 +35,7 @@ services:
       - chromadb-data:/chroma/chroma
     restart: unless-stopped
     networks:
-      - maxmind-network
+      - healthmind-network
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/heartbeat || exit 1"]
       interval: 30s
@@ -46,7 +46,7 @@ services:
   # ── Prometheus 监控 ─────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
-    container_name: maxmind-prometheus
+    container_name: healthmind-prometheus
     ports:
       - "9090:9090"
     command:
@@ -59,7 +59,7 @@ services:
       - prometheus-data:/prometheus
     restart: unless-stopped
     networks:
-      - maxmind-network
+      - healthmind-network
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
       interval: 30s
@@ -67,23 +67,23 @@ services:
       retries: 3
       start_period: 10s
 
-  # ── MaxMind 主应用 ─────────────────────────────────────────────────────────
-  maxmind:
+  # ── HealthMind 主应用 ─────────────────────────────────────────────────────────
+  healthmind:
     build:
       context: .
       dockerfile: Dockerfile
       target: production
-    container_name: maxmind-app
+    container_name: healthmind-app
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
       # 容器内固定值，覆盖 .env 中的本地路径
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-maxmind123}@redis:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-healthmind123}@redis:6379/0
       - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
-      - MAXMIND_SKILLS_DIR=/app/skills
+      - HEALTHMIND_SKILLS_DIR=/app/skills
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
@@ -96,7 +96,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - maxmind-network
+      - healthmind-network
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 30s
@@ -107,18 +107,18 @@ services:
   # ── Nginx 反向代理 ──────────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
-    container_name: maxmind-nginx
+    container_name: healthmind-nginx
     ports:
       - "80:80"
     volumes:
       - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx-logs:/var/log/nginx
     depends_on:
-      maxmind:
+      healthmind:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - maxmind-network
+      - healthmind-network
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost/health || exit 1"]
       interval: 30s
@@ -128,7 +128,7 @@ services:
 
 # ── 网络 ────────────────────────────────────────────────────────────────────
 networks:
-  maxmind-network:
+  healthmind-network:
     driver: bridge
     ipam:
       config:

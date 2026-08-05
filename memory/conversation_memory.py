@@ -4,7 +4,7 @@
 三级记忆架构，模拟人类记忆机制：
   1. 工作记忆（Redis）—— 当前会话的最近 N 条消息，毫秒级读写
   2. 情景记忆（ChromaDB）—— 跨会话的历史对话，按语义相似度检索
-  3. 用户画像（ChromaDB）—— 从对话中提炼的长期偏好和实体
+  3. 用户健康档案（ChromaDB）—— 从对话中提炼的长期健康信息（年龄、体质、健康目标等）
 
 关键设计：
   - 上下文构建时三级记忆融合，按重要性 + 时效性排序
@@ -46,7 +46,7 @@ class MemoryContext:
     """传给 Agent 的完整上下文。"""
     recent_messages:  List[Message]   # 工作记忆：最近对话
     relevant_history: List[str]       # 情景记忆：语义相关的历史片段
-    user_profile:     Dict[str, Any]  # 用户画像：偏好、常用实体
+    user_profile:     Dict[str, Any]  # 用户健康档案：基础信息、健康问题、目标
     summary:          str             # 当前会话摘要（压缩后）
 
     @staticmethod
@@ -62,7 +62,7 @@ class MemoryContext:
         if self.relevant_history:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
-            parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+            parts.append(f"[用户健康档案]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
         if self.recent_messages:
             parts.append("[最近对话]")
             for m in self.recent_messages:
@@ -74,7 +74,7 @@ class MemoryManager:
     """
     三级记忆管理器。
 
-    工作记忆存 Redis（TTL 24h），情景记忆和用户画像存 ChromaDB（持久化）。
+    工作记忆存 Redis（TTL 24h），情景记忆和用户健康档案存 ChromaDB（持久化）。
     """
 
     WORKING_MAX   = 20    # 工作记忆最大条数，超过则触发压缩
@@ -116,9 +116,9 @@ class MemoryManager:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 情景记忆：存储历史对话片段
+        # 情景记忆：存历史对话片段
         self._episodic = chroma.get_or_create_collection("episodic")
-        # 用户画像：存储提炼出的偏好和实体
+        # 用户健康档案：存提炼出的长期健康信息
         self._profile  = chroma.get_or_create_collection("user_profile")
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
@@ -156,8 +156,8 @@ class MemoryManager:
 
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
-        从当前工作记忆中提炼用户偏好，更新用户画像。
-        用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
+        从当前工作记忆中提炼用户健康信息，更新用户健康档案。
+        用 LLM 提炼档案，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
         """
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
@@ -166,7 +166,10 @@ class MemoryManager:
             return
 
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
-        prompt = f"""从以下对话中提炼用户偏好和关键实体，返回 JSON。对话:{text}返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
+        prompt = f"""从以下健康咨询对话中提炼用户的健康档案信息，返回 JSON。
+只记录用户明确提到的信息，不要推测。对话:{text}
+返回格式: {{"basic": {{"年龄": "", "性别": "", "身高": "", "体重": ""}}, "health_concerns": ["关注的健康问题"], "chronic_conditions": ["慢性病/过敏史"], "health_goals": ["健康目标"], "lifestyle": ["作息/饮食/运动习惯"]}}
+空字段用空字符串或空列表表示。"""
         prompt = self._safe_text(prompt)
 
         try:
@@ -193,9 +196,9 @@ class MemoryManager:
                 metadatas=[{"user_id": user_id, "conv_id": conv_id,
                             "ts": datetime.now().isoformat()}],
             )
-            logger.info(f"用户画像已更新: {user_id}")
+            logger.info(f"用户健康档案已更新: {user_id}")
         except Exception as ex:
-            logger.warning(f"更新用户画像失败: {ex}")
+            logger.warning(f"更新用户健康档案失败: {ex}")
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
@@ -227,9 +230,9 @@ class MemoryManager:
         if not history:
             print(f"[FLOW]   \u2502   \u2502   (空)")
 
-        # 3. 用户画像
+        # 3. 用户健康档案
         profile = await self._get_profile(user_id)
-        print(f"[FLOW]   \u2502   \u251c\u2500 [用户画像]: {json.dumps(profile, ensure_ascii=False)[:80] if profile else '(空)'}")
+        print(f"[FLOW]   │   ├─ [用户健康档案]: {json.dumps(profile, ensure_ascii=False)[:80] if profile else '(空)'}")
 
         # 4. 会话摘要（如果已压缩过）
         summary = self._redis.get(self._summary_key(user_id, conv_id)) or ""
@@ -241,7 +244,9 @@ class MemoryManager:
             user_profile=profile,
             summary=summary,
         )
-        print(f"[FLOW]   \u2514\u2500 记忆上下文: {len(recent)}条近期消息, {len(history)}条相关历史, 画像={'\u6709' if profile else '\u65e0'}, 摘要={'\u6709' if summary else '\u65e0'}")
+        has_profile = "有" if profile else "无"
+        has_summary = "有" if summary else "无"
+        print(f"[FLOW]   └─ 记忆上下文: {len(recent)}条近期消息, {len(history)}条相关历史, 画像={has_profile}, 摘要={has_summary}")
         return ctx
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
@@ -346,7 +351,7 @@ class MemoryManager:
             logger.warning(f"存储情景记忆失败: {ex}")
 
     async def _get_profile(self, user_id: str) -> Dict[str, Any]:
-        """获取用户画像（取最新一条）。"""
+        """获取用户健康档案（取最新一条）。"""
         try:
             results = self._profile.get(where={"user_id": user_id}, limit=1)
             if results["documents"]:

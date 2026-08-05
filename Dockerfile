@@ -1,4 +1,4 @@
-# MaxMind 智能客服系统 — Docker 多阶段构建
+# HealthMind 个性化健康管理助手 — Docker 多阶段构建
 # 目标：生产镜像尽量精简，开发镜像包含调试工具
 
 # ── 阶段 1：基础环境 ──────────────────────────────────────────────────────────
@@ -36,21 +36,21 @@ RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
 FROM base AS production
 
 # 非 root 用户运行。先创建用户，后续 COPY 直接带 owner，避免 chown -R 复制出额外大层。
-RUN useradd -m -u 1000 maxmind
+RUN useradd -m -u 1000 healthmind
 
 # 从依赖阶段复制已安装的包
 COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=dependencies /usr/local/bin /usr/local/bin
 # 复制预下载的 ONNX 模型缓存
-COPY --from=dependencies --chown=maxmind:maxmind /root/.cache/chroma /home/maxmind/.cache/chroma
+COPY --from=dependencies --chown=healthmind:healthmind /root/.cache/chroma /home/healthmind/.cache/chroma
 
 # 复制应用代码
-COPY --chown=maxmind:maxmind . .
+COPY --chown=healthmind:healthmind . .
 
 # 创建必要目录，只调整运行期需要写入的目录权限，避免递归 chown 整个应用。
 RUN mkdir -p /app/data/chroma /app/logs /app/config && \
-    chown maxmind:maxmind /app/data /app/data/chroma /app/logs /app/config
-USER maxmind
+    chown healthmind:healthmind /app/data /app/data/chroma /app/logs /app/config
+USER healthmind
 
 EXPOSE 8000
 

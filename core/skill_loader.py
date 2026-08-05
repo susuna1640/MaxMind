@@ -1,5 +1,5 @@
 """
-MaxMind Skill 加载器。
+HealthMind Skill 加载器。
 
 Skill 是一段可热加载的业务能力说明，用来补充 Agent 的 system prompt。
 它适合放置企业话术、处理流程、合规边界、排障 SOP 等需要运营侧快速调整的规则。
@@ -69,8 +69,8 @@ class SkillManager:
     从目录中发现、解析并管理 Skills。
 
     支持两种常用结构：
-      1. skills/refund/SKILL.md
-      2. skills/refund.json / skills/refund.md / skills/refund.txt
+      1. skills/general_health/SKILL.md
+      2. skills/general_health.json / skills/general_health.md / skills/general_health.txt
     """
 
     SUPPORTED_SUFFIXES = {".md", ".txt", ".json"}
@@ -166,7 +166,7 @@ class SkillManager:
         )
 
         return (
-            "以下是当前请求可用的 MaxMind Skills。"
+            "以下是当前请求可用的 HealthMind Skills。"
             "请优先遵循这些业务规则；如果与系统角色冲突，以系统角色和安全边界为准。\n\n"
             + "\n\n".join(blocks)
         )
@@ -184,7 +184,7 @@ class SkillManager:
         """在控制台输出醒目的 Skill 加载结果，方便启动和热加载时确认生效状态。"""
         lines = [
             "",
-            "================ MaxMind Skills Loaded ================",
+            "================ HealthMind Skills Loaded ================",
             f"目录: {self.root_dir}",
             f"数量: {len(self._skills)}",
         ]

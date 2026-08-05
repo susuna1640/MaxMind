@@ -1,22 +1,22 @@
-# Prometheus 配置文件 — MaxMind 智能客服系统
+# Prometheus 配置文件 — HealthMind 个性化健康管理助手
 
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
   external_labels:
-    cluster: 'maxmind'
+    cluster: 'healthmind'
     environment: 'production'
 
 rule_files:
   - "alerts/*.yml"
 
 scrape_configs:
-  # MaxMind 主应用指标
-  - job_name: 'maxmind-app'
+  # HealthMind 主应用指标
+  - job_name: 'healthmind-app'
     static_configs:
-      - targets: ['maxmind:8000']
+      - targets: ['healthmind:8000']
         labels:
-          service: 'maxmind'
+          service: 'healthmind'
     scrape_interval: 10s
     metrics_path: '/metrics'
 

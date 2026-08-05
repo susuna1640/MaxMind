@@ -1,7 +1,7 @@
 """
-MaxMind 智能客服系统 — FastAPI 入口
+HealthMind 个性化健康管理助手 — FastAPI 入口
 
-启动时打印小熊饼干图案。
+启动时打印品牌 Banner。
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
 """
 import asyncio
@@ -35,12 +35,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BANNER = r"""
-    ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
-   ╔══════════════════════╗
-   ║   MaxMind  v2.0     ║
-   ║   智能客服 AI 系统    ║
-   ╚══════════════════════╝
-    ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
+
+   ╔══════════════════════════╗
+   ║   HealthMind  v3.0       ║
+   ║   个性化健康管理助手      ║
+   ╚══════════════════════════╝
+
 """
 
 # ── 全局组件（lifespan 中初始化）─────────────────────────────────────────────
@@ -74,12 +74,14 @@ async def lifespan(app: FastAPI):
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from core.intent_recognizer import IntentRecognizer
+    from core.safety_checker import detect_red_flags
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
+    from tools.health_calculators import health_calculators
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -91,11 +93,11 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
-    skills_dir = os.getenv("MaxMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
+    # Skills：启动时从目录加载健康咨询规范，并在 Agent 调用 LLM 时动态注入。
+    skills_dir = os.getenv("HEALTHMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
     _skill_manager = SkillManager(
         root_dir=skills_dir,
-        max_prompt_chars=int(os.getenv("MAXMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+        max_prompt_chars=int(os.getenv("HEALTHMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
     )
     _skill_manager.load()
 
@@ -135,7 +137,7 @@ async def lifespan(app: FastAPI):
         query = params.get("query", "")
         return [{
             "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
+            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试。",
             "score": 0.0,
             "fallback": True,
             "error": error,
@@ -156,6 +158,45 @@ async def lifespan(app: FastAPI):
         cache_ttl=300.0,
         supports_rerank=True,
         fallback=knowledge_fallback,
+    ))
+
+    # 健康计算工具：BMI、饮水量、睡眠作息、运动心率（确定性计算，不依赖 LLM）
+    async def health_calc_handler(params: Dict[str, Any], context: Optional[Dict[str, Any]]):
+        return health_calculators.run_tools(
+            str(params.get("text") or ""),
+            params.get("user_profile"),
+        )
+
+    _tool_manager.register(Tool(
+        name="health_calculators",
+        description="确定性健康计算：BMI、饮水量估算、睡眠作息规划、运动心率估算",
+        handler=health_calc_handler,
+        schema={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "user_profile": {"type": "object"},
+            },
+            "required": ["text"],
+        },
+        cache_ttl=60.0,
+    ))
+
+    # 红旗症状检测：识别危险信号，决定是否优先就医提示
+    async def red_flag_handler(params: Dict[str, Any], context: Optional[Dict[str, Any]]):
+        from dataclasses import asdict
+        return asdict(detect_red_flags(str(params.get("text") or "")))
+
+    _tool_manager.register(Tool(
+        name="detect_red_flags",
+        description="红旗症状检测：识别危险信号，决定是否优先就医提示",
+        handler=red_flag_handler,
+        schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        cache_ttl=0.0,
     ))
 
     # 性能监控（可选启动 Prometheus）
@@ -179,17 +220,17 @@ async def lifespan(app: FastAPI):
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
-    logger.info("MaxMind 已就绪")
+    logger.info("HealthMind 已就绪")
     yield
 
     await _monitor.stop()
-    logger.info("MaxMind 已关闭")
+    logger.info("HealthMind 已关闭")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="MaxMind 智能客服",
-    version="2.0.0",
+    title="HealthMind 个性化健康管理助手",
+    version="3.0.0",
     lifespan=lifespan,
     docs_url="/docs",
 )
@@ -217,6 +258,7 @@ class ChatResponse(BaseModel):
     escalated:   bool
     latency_ms:  float
     knowledge_used: bool = False
+    red_flag:    bool = False   # 是否命中红旗症状（就医预警）
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -250,7 +292,7 @@ async def reload_skills():
 async def chat(req: ChatRequest):
     """
     主对话接口。完整流程：
-      记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
+      安全前置检查 → 记忆读取 → 健康计算/知识库注入 → Agent 路由执行 → 记忆写入
     """
     print(f"\n{'='*60}")
     print(f"[FLOW] 收到请求: user={req.user_id}, message=\"{req.message}\"")
@@ -259,9 +301,16 @@ async def chat(req: ChatRequest):
         raise HTTPException(503, "服务未就绪")
 
     from agents.agent_orchestrator import Request as OrcReq
+    from core.intent_recognizer import IntentCategory, UrgencyLevel
+    from core.safety_checker import detect_red_flags
     from memory.conversation_memory import MsgRole
 
     conv_id = req.conv_id or str(uuid.uuid4())
+
+    # 0. 安全前置检查：红旗症状命中则强制进入就医预警链路
+    safety = detect_red_flags(req.message)
+    if safety.is_high_risk:
+        print(f"[FLOW] Step 0/4: 红旗症状检测命中: {safety.matched_flags}")
 
     # 1. 读取记忆上下文
     print("[FLOW] Step 1/4: 读取三级记忆上下文...")
@@ -274,9 +323,17 @@ async def chat(req: ChatRequest):
     ] if mem_ctx.recent_messages else None
 
     knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
+    health_tool_text = await _build_health_tool_context(req.message, mem_ctx.user_profile)
     context_parts = [mem_ctx.to_prompt_text()]
+    if safety.is_high_risk:
+        context_parts.append(
+            f"[安全提示] 检测到红旗症状: {', '.join(safety.matched_flags)}。"
+            "请优先建议用户立即就医，不要给出可能延误就医的调理方案。"
+        )
     if knowledge_text:
         context_parts.append(knowledge_text)
+    if health_tool_text:
+        context_parts.append(health_tool_text)
     full_context = "\n\n".join(part for part in context_parts if part)
 
     orch_req = OrcReq(
@@ -286,6 +343,10 @@ async def chat(req: ChatRequest):
         context=full_context,
         history=history,
     )
+    # 红旗症状：跳过常规意图识别，直接强制路由到就医预警 Agent
+    if safety.is_high_risk:
+        orch_req.intent  = IntentCategory.ESCALATION
+        orch_req.urgency = UrgencyLevel.CRITICAL
 
     # 3. 执行（进入编排器：意图识别 → Agent 路由 → LLM 调用）
     print(f"[FLOW] Step 3/4: 进入编排器...")
@@ -321,6 +382,7 @@ async def chat(req: ChatRequest):
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
         knowledge_used=knowledge_used,
+        red_flag=safety.is_high_risk,
     )
 
 
@@ -354,27 +416,54 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
 
         if not used:
             return "", False
-        parts.append("请优先依据以上知识库内容回答；如果知识库内容不足，再结合通用客服能力说明。")
+        parts.append("请优先依据以上知识库内容回答；如果知识库内容不足，再结合通用健康知识说明。")
         return "\n".join(parts), True
     except Exception as ex:
         logger.warning(f"构建知识库上下文失败: {ex}")
         return "", False
 
 
+async def _build_health_tool_context(message: str, user_profile: Dict[str, Any]) -> str:
+    """
+    方案 A：健康计算工具由 /chat 按关键词触发，结果注入 Agent 上下文。
+
+    复用 MCPToolManager 的熔断、缓存、参数校验能力，
+    保证回复中的 BMI/饮水量/心率等数值来自确定性工具而非模型编造。
+    """
+    if _tool_manager is None:
+        return ""
+    from tools.health_calculators import health_calculators
+    if not health_calculators.should_trigger(message):
+        return ""
+    try:
+        result = await _tool_manager.call(
+            "health_calculators",
+            {"text": message, "user_profile": user_profile or {}},
+        )
+        if not result.success or not isinstance(result.data, list) or not result.data:
+            return ""
+        print(f"[FLOW]   ├─ [健康计算工具] 命中 {len(result.data)} 个工具: {[r['name'] for r in result.data]}")
+        return health_calculators.format_for_prompt(result.data)
+    except Exception as ex:
+        logger.warning(f"健康计算工具调用失败: {ex}")
+        return ""
+
+
 def _should_use_knowledge(message: str) -> bool:
-    """跳过纯寒暄，业务类问题才检索知识库，避免无关 RAG 干扰回复。"""
+    """跳过纯寒暄，健康类问题才检索知识库，避免无关 RAG 干扰回复。"""
     msg = (message or "").strip().lower()
     if not msg:
         return False
     greetings = {"你好", "您好", "嗨", "hi", "hello", "hey", "早上好", "晚上好"}
     if msg in greetings:
         return False
-    business_keywords = [
-        "退款", "订单", "物流", "配送", "发票", "扣款", "支付", "账单", "订阅",
-        "登录", "报错", "错误", "崩溃", "会员", "积分", "账户", "密码", "地址",
-        "refund", "order", "invoice", "payment", "error", "login",
+    health_keywords = [
+        "养胃", "养肝", "祛湿", "湿气", "失眠", "睡眠", "作息", "运动", "锻炼",
+        "减肥", "减脂", "饮食", "营养", "食疗", "体质", "调理", "养生", "心率",
+        "症状", "不适", "疲劳", "季节", "秋", "冬", "春", "夏",
+        "sleep", "diet", "exercise", "health",
     ]
-    return len(msg) >= 4 or any(kw in msg for kw in business_keywords)
+    return len(msg) >= 4 or any(kw in msg for kw in health_keywords)
 
 
 @app.get("/monitor")
@@ -446,8 +535,8 @@ async def add_knowledge(body: BatchDocInput):
     ```json
     {
       "documents": [
-        {"title": "退款政策", "content": "用户在购买后 7 天内可以申请无理由退款..."},
-        {"title": "配送说明", "content": "标准配送 3-5 个工作日..."}
+        {"title": "养胃指南", "content": "规律三餐、少食生冷辛辣，是养胃的基础..."},
+        {"title": "睡眠建议", "content": "建议成人每晚保证 7-9 小时睡眠..."}
       ]
     }
     ```
@@ -568,7 +657,7 @@ async def run_eval(body: Optional[EvalRunInput] = None):
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────
 async def _cli():
     print(BANNER)
-    print("MaxMind CLI — 输入 quit 退出\n")
+    print("HealthMind CLI — 输入 quit 退出\n")
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from memory.conversation_memory import MemoryManager, MsgRole
@@ -576,8 +665,8 @@ async def _cli():
 
     cfg = _anthropic_cfg()
     skill_manager = SkillManager(
-        root_dir=os.getenv("MAXMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
-        max_prompt_chars=int(os.getenv("MAXMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
+        root_dir=os.getenv("HEALTHMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
+        max_prompt_chars=int(os.getenv("HEALTHMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
     )
     skill_manager.load()
     orch = AgentOrchestrator(
@@ -619,7 +708,7 @@ async def _cli():
         await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-        print(f"\nMaxMind [{result.agent_type.value}]: {result.response}\n")
+        print(f"\nHealthMind [{result.agent_type.value}]: {result.response}\n")
 
 
 if __name__ == "__main__":

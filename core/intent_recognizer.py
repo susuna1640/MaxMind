@@ -24,15 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 class IntentCategory(Enum):
-    QUERY      = "query"       # 查询信息
-    COMPLAINT  = "complaint"   # 投诉不满
-    REQUEST    = "request"     # 请求操作
+    CONSULT    = "consult"     # 一般健康咨询（症状调理、体质疑问）
+    NUTRITION  = "nutrition"   # 饮食/营养（养胃、食疗、减脂饮食）
+    FITNESS    = "fitness"     # 运动/睡眠（锻炼、作息、失眠调理）
+    CALCULATE  = "calculate"   # 健康计算（BMI、饮水量、作息、运动心率）
+    PROFILE    = "profile"     # 记录/更新个人健康档案
+    ESCALATION = "escalation"  # 急症信号/就医预警
     GREETING   = "greeting"    # 问候
-    ESCALATION = "escalation"  # 要求升级/转人工
-    TECHNICAL  = "technical"   # 技术问题
-    BILLING    = "billing"     # 账单/退款
-    ACCOUNT    = "account"     # 账户管理
-    FEEDBACK   = "feedback"    # 正面反馈
     OTHER      = "other"
 
 
@@ -55,22 +53,21 @@ class IntentResult:
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
 _TEMPLATES: Dict[IntentCategory, List[str]] = {
-    IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？"],
-    IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
-    IntentCategory.REQUEST:    ["帮我取消订单", "我需要修改地址", "请协助退款"],
+    IntentCategory.CONSULT:    ["湿气重应该怎么调理？", "最近总觉得很累是什么原因？", "体质偏寒平时要注意什么？"],
+    IntentCategory.NUTRITION:  ["吃什么可以养胃？", "减脂期间应该怎么吃？", "养肝吃什么食物好？"],
+    IntentCategory.FITNESS:    ["晚上睡不着怎么调理？", "每天跑步多少合适？", "如何制定减脂运动计划？"],
+    IntentCategory.CALCULATE:  ["身高170体重70，帮我算一下BMI", "体重60kg每天喝多少水合适？", "早上7点起床，晚上几点睡比较好？"],
+    IntentCategory.PROFILE:    ["记一下我今年30岁，身高170", "把我对海鲜过敏记到健康档案里", "更新我的体重为65公斤"],
+    IntentCategory.ESCALATION: ["我胸口疼得厉害还喘不上气", "高烧三天一直不退", "突然剧烈头痛还呕吐"],
     IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
-    IntentCategory.ESCALATION: ["我要投诉！", "转人工客服", "找你们经理"],
-    IntentCategory.TECHNICAL:  ["应用一直崩溃", "无法登录", "出现500错误"],
-    IntentCategory.BILLING:    ["为什么扣了两次款？", "申请退款", "发票问题"],
-    IntentCategory.ACCOUNT:    ["修改邮箱", "注销账户", "更新个人信息"],
-    IntentCategory.FEEDBACK:   ["服务很棒！", "非常满意", "给个好评"],
 }
 
-# 紧急关键词
+# 紧急关键词：CRITICAL 由红旗症状（危险信号）承担，命中即触发就医预警
 _URGENCY_KEYWORDS = {
-    UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
-    UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
-    UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
+    UrgencyLevel.CRITICAL: ["胸痛", "胸闷", "呼吸困难", "昏迷", "抽搐", "大出血", "吐血",
+                            "咯血", "黑便", "剧烈头痛", "偏瘫", "高烧不退", "意识模糊", "休克"],
+    UrgencyLevel.HIGH:     ["紧急", "emergency", "urgent", "asap", "立刻", "马上就医"],
+    UrgencyLevel.MEDIUM:   ["今天", "马上", "尽快", "hurry", "now"],
 }
 
 
@@ -203,7 +200,7 @@ class IntentRecognizer:
                 for m in history[-3:]
             )
 
-        prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
+        prompt = f"""你是健康管理意图分析专家。根据示例判断用户意图，返回 JSON。
 
 示例:
 {examples}
@@ -264,14 +261,19 @@ class IntentRecognizer:
         """策略 3：关键词模式匹配（同步，零延迟兜底）。"""
         msg = message.lower()
         patterns = {
-            IntentCategory.ESCALATION: ["投诉", "经理", "转人工", "supervisor"],
-            IntentCategory.COMPLAINT:  ["太差", "糟糕", "horrible", "等了很久"],
-            IntentCategory.QUERY:      ["?", "？", "怎么", "什么", "status"],
-            IntentCategory.REQUEST:    ["帮我", "需要", "please", "help"],
+            IntentCategory.ESCALATION: ["胸痛", "胸闷", "呼吸困难", "昏迷", "抽搐", "大出血",
+                                        "吐血", "咯血", "黑便", "剧烈头痛", "偏瘫", "高烧不退",
+                                        "意识模糊", "急诊"],
+            IntentCategory.CALCULATE:  ["bmi", "BMI", "体重指数", "喝多少水", "饮水量", "几点睡",
+                                        "入睡时间", "心率", "卡路里"],
+            IntentCategory.NUTRITION:  ["养胃", "养肝", "祛湿", "湿气", "食疗", "减肥吃", "减脂吃",
+                                        "怎么吃", "吃什么", "营养", "食谱", "忌口"],
+            IntentCategory.FITNESS:    ["失眠", "睡不着", "作息", "熬夜", "跑步", "锻炼", "健身",
+                                        "运动计划", "减脂运动", "睡眠"],
+            IntentCategory.PROFILE:    ["记一下", "记住我", "健康档案", "我的身高", "我的体重",
+                                        "过敏史", "慢性病史", "更新我的"],
+            IntentCategory.CONSULT:    ["怎么调理", "怎么办", "什么原因", "需要注意什么", "体质"],
             IntentCategory.GREETING:   ["你好", "嗨", "hello", "hi"],
-            IntentCategory.BILLING:    ["退款", "扣款", "发票", "refund"],
-            IntentCategory.TECHNICAL:  ["崩溃", "报错", "error", "crash"],
-            IntentCategory.ACCOUNT:    ["密码", "邮箱", "账户", "password"],
         }
         best_cat, best_score = IntentCategory.OTHER, 0.0
         for cat, kws in patterns.items():
@@ -311,9 +313,9 @@ class IntentRecognizer:
     async def _extract_entities(self, message: str) -> Dict[str, List[str]]:
         """用 LLM 从消息中提取结构化实体。"""
         message = self._clean_text(message)
-        prompt = f"""从客服消息中提取实体，返回 JSON（字段值为列表，没有则为空列表）:
+        prompt = f"""从健康咨询消息中提取实体，返回 JSON（字段值为列表，没有则为空列表）:
 消息: "{message}"
-格式: {{"order_id":[],"product":[],"date":[],"amount":[],"error_code":[]}}"""
+格式: {{"symptom":[],"body_part":[],"age":[],"height":[],"weight":[],"goal":[]}}"""
         prompt = self._clean_text(prompt)
         try:
             resp = await self.client.messages.create(
@@ -324,7 +326,7 @@ class IntentRecognizer:
             s, e = raw.find("{"), raw.rfind("}") + 1
             return json.loads(raw[s:e])
         except Exception:
-            return {"order_id": [], "product": [], "date": [], "amount": [], "error_code": []}
+            return {"symptom": [], "body_part": [], "age": [], "height": [], "weight": [], "goal": []}
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
@@ -382,12 +384,11 @@ class IntentRecognizer:
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()
         for level, kws in _URGENCY_KEYWORDS.items():
-            if any(kw in msg for kw in kws):
+            if any(kw.lower() in msg for kw in kws):
                 return level
+        # 就医预警类意图一律按最高紧急度处理，确保路由到就医预警链路
         if intent == IntentCategory.ESCALATION:
-            return UrgencyLevel.HIGH
-        if intent == IntentCategory.COMPLAINT:
-            return UrgencyLevel.MEDIUM
+            return UrgencyLevel.CRITICAL
         return UrgencyLevel.LOW
 
     def _cache_key(self, message: str) -> str:

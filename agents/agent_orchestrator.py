@@ -6,14 +6,15 @@
 路由策略（三层决策）：
   1. 意图路由 —— 根据 IntentCategory 直接映射到专属 Agent
   2. 性能路由 —— 同类 Agent 有多个时，选成功率最高、延迟最低的
-  3. 降级路由 —— 专属 Agent 不可用时，自动降级到 GeneralAgent
+  3. 降级路由 —— 专属 Agent 不可用时，自动降级到 HealthAgent
 
 并行协作：
-  - 复杂问题（如"技术问题 + 账单问题"）可同时派发给多个 Agent
+  - 复杂问题（如"减脂 = 饮食 + 运动"）可同时派发给多个 Agent
   - 结果由 Orchestrator 合并后返回
 
 升级机制：
-  - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
+  - 红旗症状/急症信号 → 路由到就医预警 Agent，优先建议线下就医
+  - Agent 置信度低或处理失败 → 降级到 HealthAgent 兜底
 """
 import asyncio
 import logging
@@ -33,10 +34,10 @@ logger = logging.getLogger(__name__)
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class AgentType(Enum):
-    GENERAL   = "general"    # 通用客服
-    TECHNICAL = "technical"  # 技术支持
-    BILLING   = "billing"    # 账单/退款
-    ESCALATION = "escalation" # 人工升级（占位）
+    HEALTH     = "health"      # 通用健康顾问（默认）
+    NUTRITION  = "nutrition"   # 饮食/营养顾问
+    FITNESS    = "fitness"     # 运动/睡眠顾问
+    ESCALATION = "escalation"  # 就医预警（红旗症状/急症）
 
 
 @dataclass
@@ -182,32 +183,49 @@ class BaseAgent:
         return f"{self.system_prompt}\n\n[动态 Skills]\n{skill_prompt}"
 
     def _needs_escalation(self, content: str) -> bool:
-        """检测 Agent 是否建议升级（简单关键词检测）。"""
-        keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
+        """检测 Agent 是否建议就医（简单关键词检测）。"""
+        keywords = ["建议就医", "尽快就医", "及时就医", "立即就医", "急诊", "拨打 120", "拨打120", "医院就诊"]
         return any(kw in content for kw in keywords)
 
 
-class GeneralAgent(BaseAgent):
-    agent_type    = AgentType.GENERAL
+class HealthAgent(BaseAgent):
+    agent_type    = AgentType.HEALTH
     system_prompt = (
-        "你是 MaxMind 智能客服。友好、简洁地回答用户问题。"
-        "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
+        "你是 HealthMind 个性化健康顾问。友好、专业地回答健康养生问题，"
+        "结合用户健康档案给出个性化建议。"
+        "安全边界：不做疾病诊断、不推荐处方药、不替代医生；"
+        "涉及疾病判断或持续不适时，明确建议就医。"
+        "传统养生内容（如食疗、穴位）属于经验参考，需提示仅供参考。"
     )
 
 
-class TechnicalAgent(BaseAgent):
-    agent_type    = AgentType.TECHNICAL
+class NutritionAgent(BaseAgent):
+    agent_type    = AgentType.NUTRITION
     system_prompt = (
-        "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
-        "提供清晰的步骤化解决方案。遇到需要后台操作的问题，说明需要升级处理。"
+        "你是饮食营养顾问。专注于：养胃食疗、营养搭配、减脂饮食、体质调理饮食。"
+        "给出具体可执行的饮食建议（食物、分量、频次）。"
+        "涉及糖尿病、肾病等慢性病的饮食调整时，说明需要医生或营养师个体化评估。"
+        "传统养生食疗属于经验参考，需提示仅供参考。"
     )
 
 
-class BillingAgent(BaseAgent):
-    agent_type    = AgentType.BILLING
+class FitnessAgent(BaseAgent):
+    agent_type    = AgentType.FITNESS
     system_prompt = (
-        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "你是运动与睡眠顾问。专注于：运动计划、运动心率、作息调理、失眠改善。"
+        "提供清晰的步骤化方案（频率、强度、时长）。"
+        "涉及心血管不适、关节伤痛等情况时，说明需要先咨询医生再运动。"
+    )
+
+
+class MedicalAlertAgent(BaseAgent):
+    agent_type    = AgentType.ESCALATION
+    system_prompt = (
+        "你是健康紧急响应助手。用户描述了可能的急症或危险信号。"
+        "回复必须以就医提示开头：建议立即就医或拨打急救电话（120），"
+        "简要说明为什么这些症状需要专业医疗评估，"
+        "在就医前给出安全的临时注意事项（如保持静止、有人陪同）。"
+        "严禁给出诊断结论、用药建议或任何可能延误就医的调理方案。"
     )
 
 
@@ -220,16 +238,15 @@ class AgentOrchestrator:
     路由逻辑（三层）：
       1. 意图 → Agent 类型映射
       2. 同类多实例时按 routing_score() 选最优
-      3. 专属 Agent 失败时降级到 GeneralAgent
+      3. 专属 Agent 失败时降级到 HealthAgent
     """
 
     # 意图 → Agent 类型的静态映射（路由表）
     _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
-        IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
-        IntentCategory.BILLING:    AgentType.BILLING,
-        IntentCategory.ACCOUNT:    AgentType.BILLING,
+        IntentCategory.NUTRITION:  AgentType.NUTRITION,
+        IntentCategory.FITNESS:    AgentType.FITNESS,
         IntentCategory.ESCALATION: AgentType.ESCALATION,
-        # 其余意图 → GENERAL（默认）
+        # CONSULT/CALCULATE/PROFILE/GREETING/OTHER → HEALTH（默认）
     }
 
     def __init__(
@@ -249,9 +266,10 @@ class AgentOrchestrator:
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL:   [GeneralAgent(client, model, skill_manager)],
-            AgentType.TECHNICAL: [TechnicalAgent(client, model, skill_manager)],
-            AgentType.BILLING:   [BillingAgent(client, model, skill_manager)],
+            AgentType.HEALTH:     [HealthAgent(client, model, skill_manager)],
+            AgentType.NUTRITION:  [NutritionAgent(client, model, skill_manager)],
+            AgentType.FITNESS:    [FitnessAgent(client, model, skill_manager)],
+            AgentType.ESCALATION: [MedicalAlertAgent(client, model, skill_manager)],
         }
 
     def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
@@ -279,7 +297,7 @@ class AgentOrchestrator:
             req.urgency = intent_result.urgency
             print(f"[FLOW]   \u251c\u2500 意图识别完成: intent={req.intent.value}, urgency={req.urgency.name}")
 
-        # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
+        # 复杂问题自动并行协作，例如同一句同时涉及减脂目标和饮食/运动安排。
         collaboration = self._collaboration_targets(req)
         if len(collaboration) > 1:
             return await self.run_parallel(req, collaboration)
@@ -293,12 +311,12 @@ class AgentOrchestrator:
         response = await self._execute(req, agent_type)
         print(f"[FLOW]   \u2514\u2500 Agent 返回: success={response.success}, 耗时 {response.latency_ms:.0f}ms")
 
-        # 4. 升级检查
+        # 4. 升级检查（健康域：红旗症状/急症 → 就医预警）
         escalated = False
         if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
             escalated = True
-            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：此处创建工单、通知人工客服
+            logger.warning(f"请求 {req.request_id} 触发就医预警: urgency={req.urgency}")
+            # 生产环境：此处可推送就医提醒、创建随访工单
 
         return OrchestratorResult(
             request_id=req.request_id,
@@ -354,25 +372,32 @@ class AgentOrchestrator:
             if target in self._pool and self._pool[target]:
                 return target
 
-        return AgentType.GENERAL
+        return AgentType.HEALTH
 
     def _collaboration_targets(self, req: Request) -> List[AgentType]:
         """
         判断是否需要多个 Agent 并行协作。
 
         意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
-        例如"登录报错且被重复扣款"需要技术和账单 Agent 同时处理。
+        例如"减脂"同时涉及饮食和运动，需要两个 Agent 并行处理。
         """
         msg = req.message.lower()
         targets: List[AgentType] = []
 
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
-        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
+        nutrition_kws = ["饮食", "吃什么", "食谱", "养胃", "食疗", "营养", "忌口"]
+        fitness_kws = ["运动", "锻炼", "跑步", "健身", "睡眠", "失眠", "作息"]
+        combined_kws = ["减脂", "减肥", "瘦身", "增肌"]  # 天然需要饮食 + 运动协作
 
-        if req.intent == IntentCategory.TECHNICAL or any(kw in msg for kw in technical_kws):
-            targets.append(AgentType.TECHNICAL)
-        if req.intent in (IntentCategory.BILLING, IntentCategory.ACCOUNT) or any(kw in msg for kw in billing_kws):
-            targets.append(AgentType.BILLING)
+        if req.intent == IntentCategory.NUTRITION or any(kw in msg for kw in nutrition_kws):
+            targets.append(AgentType.NUTRITION)
+        if req.intent == IntentCategory.FITNESS or any(kw in msg for kw in fitness_kws):
+            targets.append(AgentType.FITNESS)
+        # 复合目标（减脂等）同时命中两侧关键词才触发协作，避免普通单域问题被拆分
+        if any(kw in msg for kw in combined_kws) and req.intent in (IntentCategory.NUTRITION, IntentCategory.FITNESS, IntentCategory.CONSULT):
+            if AgentType.NUTRITION not in targets:
+                targets.append(AgentType.NUTRITION)
+            if AgentType.FITNESS not in targets:
+                targets.append(AgentType.FITNESS)
 
         # 保持顺序去重，并只返回当前有实例的 Agent 类型。
         deduped = list(dict.fromkeys(targets))
@@ -389,23 +414,23 @@ class AgentOrchestrator:
         return max(agents, key=lambda a: a.stats.routing_score())
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
-        """执行 Agent，失败时降级到 GeneralAgent。"""
+        """执行 Agent，失败时降级到 HealthAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
-            agent = self._best_agent(AgentType.GENERAL)
+            agent = self._best_agent(AgentType.HEALTH)
         if agent is None:
             return AgentResponse(
-                agent_type=AgentType.GENERAL,
+                agent_type=AgentType.HEALTH,
                 content="服务暂时不可用，请稍后重试。",
                 success=False,
             )
 
         response = await agent.handle(req)
 
-        # 专属 Agent 失败时降级到 GeneralAgent
-        if not response.success and agent_type != AgentType.GENERAL:
-            logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
-            fallback = self._best_agent(AgentType.GENERAL)
+        # 专属 Agent 失败时降级到 HealthAgent；就医预警不降级，保证安全链路不被吞掉
+        if not response.success and agent_type not in (AgentType.HEALTH, AgentType.ESCALATION):
+            logger.warning(f"{agent_type.value} 失败，降级到 HealthAgent")
+            fallback = self._best_agent(AgentType.HEALTH)
             if fallback:
                 response = await fallback.handle(req)
 

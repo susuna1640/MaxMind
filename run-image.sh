@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# MaxMind 镜像运行脚本
+# HealthMind 镜像运行脚本
 # 提供多种运行配置选项
 
 set -e
 
 # 配置
-IMAGE_NAME="maxmind"
-CONTAINER_NAME="maxmind-app"
+IMAGE_NAME="healthmind"
+CONTAINER_NAME="healthmind-app"
 VERSION=${VERSION:-latest}
 REGISTRY=""  # 如果镜像在私有仓库，设置为 registry.example.com/
 
@@ -40,7 +40,7 @@ print_error() {
 
 show_help() {
     cat << EOF
-MaxMind Docker 镜像运行工具
+HealthMind Docker 镜像运行工具
 
 用法: ./run-image.sh [命令] [选项]
 

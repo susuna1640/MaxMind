@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# MaxMind 智能客服系统 - Docker 部署脚本
+# HealthMind 个性化健康管理助手 - Docker 部署脚本
 
 
 set -e
@@ -12,7 +12,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # 配置
-PROJECT_NAME="maxmind"
+PROJECT_NAME="healthmind"
 COMPOSE_FILE="docker-compose.yml"
 ENV_FILE=".env"
 
@@ -197,10 +197,10 @@ backup_data() {
 
     # 备份 Redis 数据
     docker-compose exec -T redis redis-cli SAVE
-    docker cp maxmind-redis:/data/dump.rdb "$backup_dir/"
+    docker cp healthmind-redis:/data/dump.rdb "$backup_dir/"
 
     # 备份 ChromaDB 数据
-    docker cp maxmind-chromadb:/chroma/chroma "$backup_dir/"
+    docker cp healthmind-chromadb:/chroma/chroma "$backup_dir/"
 
     # 备份配置
     cp .env "$backup_dir/"
@@ -232,10 +232,10 @@ restore_data() {
         docker-compose stop
 
         # 恢复 Redis 数据
-        docker cp "$backup_dir/dump.rdb" maxmind-redis:/data/
+        docker cp "$backup_dir/dump.rdb" healthmind-redis:/data/
 
         # 恢复 ChromaDB 数据
-        docker cp "$backup_dir/chroma" maxmind-chromadb:/chroma/
+        docker cp "$backup_dir/chroma" healthmind-chromadb:/chroma/
 
         # 恢复配置
         cp "$backup_dir/.env" .env
@@ -254,7 +254,7 @@ restore_data() {
 # 函数：显示帮助信息
 show_help() {
     cat << EOF
-MaxMind 智能客服系统 - Docker 部署脚本
+HealthMind 个性化健康管理助手 - Docker 部署脚本
 
 用法: ./docker-deploy.sh [命令]
 
@@ -275,7 +275,7 @@ MaxMind 智能客服系统 - Docker 部署脚本
 示例:
     ./docker-deploy.sh install
     ./docker-deploy.sh start
-    ./docker-deploy.sh logs maxmind
+    ./docker-deploy.sh logs healthmind
     ./docker-deploy.sh backup
     ./docker-deploy.sh restore backups/20231201_120000
 
