@@ -54,6 +54,21 @@ _evaluator    = None
 _skill_manager = None
 _bmi_store    = None
 
+# ── 混合式工具调用的慢通道配置 ───────────────────────────────────────────────────
+# function calling 总开关：关闭后回退纯关键词快通道（降级开关）
+ENABLE_FUNCTION_CALLING = os.getenv("ENABLE_FUNCTION_CALLING", "1") not in ("0", "false", "False")
+# 按 Agent 类型的工具白名单：编排层治理“哪些工具对哪个 Agent 开放”
+AGENT_TOOL_WHITELIST: Dict[str, List[str]] = {
+    "health":     ["health_calculators", "bmi_trend_history", "external_health_api"],
+    "nutrition":  ["health_calculators", "bmi_trend_history"],
+    "fitness":    ["health_calculators", "bmi_trend_history", "external_health_api"],
+    "escalation": [],   # 就医预警场景不给工具，避免延误就医
+}
+# 不开放给 LLM 自主调用的工具：knowledge_search 已由 RAG 链路注入；detect_red_flags 在 /chat 前置执行
+_INTERNAL_TOOLS = {"knowledge_search", "detect_red_flags"}
+# 当前请求的 user_id 持有器：供慢通道工具后置钩子（BMI 落盘）使用
+req_user_id_holder: Dict[str, str] = {"uid": ""}
+
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -106,12 +121,13 @@ async def lifespan(app: FastAPI):
     )
     _skill_manager.load()
 
-    # Agent 编排器
+    # Agent 编排器（agent_tools_map：慢通道按 Agent 类型收紧工具白名单）
     _orchestrator = AgentOrchestrator(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
         skill_manager=_skill_manager,
+        agent_tools_map=AGENT_TOOL_WHITELIST,
     )
 
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
@@ -167,14 +183,19 @@ async def lifespan(app: FastAPI):
 
     # 健康计算工具：BMI、饮水量、睡眠作息、运动心率（确定性计算，不依赖 LLM）
     async def health_calc_handler(params: Dict[str, Any], context: Optional[Dict[str, Any]]):
+        # 慢通道：用户档案从请求上下文取（LLM 无需生成）；快通道仍可从 params 传入
+        profile = (context or {}).get("user_profile") or params.get("user_profile")
         return health_calculators.run_tools(
             str(params.get("text") or ""),
-            params.get("user_profile"),
+            profile,
         )
 
     _tool_manager.register(Tool(
         name="health_calculators",
-        description="确定性健康计算：BMI、饮水量估算、睡眠作息规划、运动心率估算",
+        description=(
+            "确定性健康计算：BMI、饮水量估算、睡眠作息规划、运动心率估算。"
+            "text 传入用户原话（内含身高体重等数值），系统自动识别并计算。"
+        ),
         handler=health_calc_handler,
         schema={
             "type": "object",
@@ -208,7 +229,9 @@ async def lifespan(app: FastAPI):
     _bmi_store = BmiHistoryStore(redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"))
 
     async def bmi_trend_handler(params: Dict[str, Any], context: Optional[Dict[str, Any]]):
-        summary = _bmi_store.summarize(str(params.get("user_id") or "u1001"))
+        # 优先用请求上下文的 user_id，避免依赖 LLM 生成的参数
+        uid = (context or {}).get("user_id") or str(params.get("user_id") or "u1001")
+        summary = _bmi_store.summarize(uid)
         return summary or {
             "record_count": 0,
             "summary_text": "暂无 BMI 历史记录，可先说「身高170 体重70 算一下BMI」建立首条记录。",
@@ -216,24 +239,33 @@ async def lifespan(app: FastAPI):
 
     _tool_manager.register(Tool(
         name="bmi_trend_history",
-        description="BMI 历史趋势：读取 Redis 中用户的 BMI 记录并生成趋势摘要",
+        description="BMI 历史趋势：读取当前用户的 BMI 历史记录并生成趋势摘要（用户问体重/BMI变化、趋势时调用）",
         handler=bmi_trend_handler,
         schema={
             "type": "object",
-            "properties": {"user_id": {"type": "string"}},
-            "required": ["user_id"],
+            "properties": {},
         },
         cache_ttl=0.0,
     ))
 
     # 外部环境健康工具：真实外部 API（Open-Meteo），展示熔断/超时/降级保护
+    def _resolve_env_city(params: Dict[str, Any], context: Optional[Dict[str, Any]]) -> str:
+        """城市兜底顺序：LLM/用户显式指定 → 用户档案常住城市 → 默认北京。"""
+        city = str(params.get("city") or "").strip()
+        if city:
+            return city
+        profile = (context or {}).get("user_profile") or {}
+        city = str(profile.get("default_city") or "").strip()
+        return city or external_health.DEFAULT_CITY
+
     async def env_health_handler(params: Dict[str, Any], context: Optional[Dict[str, Any]]):
-        report = await external_health.fetch_env_report(str(params.get("city") or external_health.DEFAULT_CITY))
+        city = _resolve_env_city(params, context)
+        report = await external_health.fetch_env_report(city)
         report["summary_text"] = external_health.format_report(report)
         return report
 
     def env_health_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        city = str(params.get("city") or external_health.DEFAULT_CITY)
+        city = _resolve_env_city(params, context)
         return {
             "city": city, "fallback": True, "error": error,
             "summary_text": f"{city}的实时空气与天气数据暂时无法获取（外部 API 不可用），户外活动请依据自身实际环境判断。",
@@ -241,7 +273,12 @@ async def lifespan(app: FastAPI):
 
     _tool_manager.register(Tool(
         name="external_health_api",
-        description="外部环境健康：实时空气质量与天气（Open-Meteo），给出户外活动建议",
+        description=(
+            "外部环境健康：实时空气质量与天气（Open-Meteo），给出户外活动建议。"
+            "用户询问能否户外运动/跑步、空气质量、天气时，直接调用本工具获取实时数据，"
+            "不要反问用户；city 可选（北京/上海/广州/深圳/杭州/成都/武汉/西安/南京/重庆/长沙/天津），"
+            "用户未说明城市时省略该参数，系统自动按其档案中的常住城市查询（无记录时默认北京）。"
+        ),
         handler=env_health_handler,
         schema={
             "type": "object",
@@ -251,6 +288,24 @@ async def lifespan(app: FastAPI):
         timeout_s=12.0,
         fallback=env_health_fallback,
     ))
+
+    # 慢通道接线：把工具管理器注入编排器，Agent 层启用 function calling
+    _orchestrator.set_tool_manager(_tool_manager)
+
+    def _after_tool_call(tool_name: str, params: Dict[str, Any], data: Any):
+        """慢通道工具执行后钩子：BMI 算出同样自动落盘历史（与快通道行为一致）。"""
+        if tool_name != "health_calculators" or not isinstance(data, list):
+            return
+        for item in data:
+            if item.get("name") != "bmi_calculator" or _bmi_store is None:
+                continue
+            d = item.get("data", {})
+            if _bmi_store.record(req_user_id_holder["uid"], d.get("height_cm", 0), d.get("weight_kg", 0), d.get("bmi", 0)):
+                print(f"[FLOW]   │   ├─ [BMI 历史·慢通道] 已为用户 {req_user_id_holder['uid']} 落盘一条记录")
+
+    for agents in _orchestrator._pool.values():
+        for agent in agents:
+            agent._after_tool_call = _after_tool_call
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -376,8 +431,9 @@ async def chat(req: ChatRequest):
     ] if mem_ctx.recent_messages else None
 
     knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
-    health_tool_text = await _build_health_tool_context(req.message, mem_ctx.user_profile, req.user_id)
-    env_tool_text = await _build_env_context(req.message)
+    health_tool_text, health_tools_used = await _build_health_tool_context(req.message, mem_ctx.user_profile, req.user_id)
+    env_tool_text, env_tools_used = await _build_env_context(req.message, mem_ctx.user_profile)
+    fast_tools_used = health_tools_used + env_tools_used
     context_parts = [mem_ctx.to_prompt_text()]
     if safety.is_high_risk:
         context_parts.append(
@@ -398,7 +454,12 @@ async def chat(req: ChatRequest):
         conv_id=conv_id,
         context=full_context,
         history=history,
+        tools_allow=_decide_tools_allow(safety.is_high_risk, fast_tools_used),
+        tools_used=fast_tools_used,
+        tool_context={"user_id": req.user_id, "user_profile": mem_ctx.user_profile or {}},
     )
+    # 慢通道后置钩子（BMI 落盘）需要当前请求的 user_id
+    req_user_id_holder["uid"] = req.user_id
     # 红旗症状：跳过常规意图识别，直接强制路由到就医预警 Agent
     if safety.is_high_risk:
         orch_req.intent  = IntentCategory.ESCALATION
@@ -479,19 +540,21 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
         return "", False
 
 
-async def _build_health_tool_context(message: str, user_profile: Dict[str, Any], user_id: str = "") -> str:
+async def _build_health_tool_context(message: str, user_profile: Dict[str, Any], user_id: str = "") -> tuple:
     """
-    方案 A：健康计算工具由 /chat 按关键词触发，结果注入 Agent 上下文。
+    快通道：健康计算工具由 /chat 按关键词触发，结果注入 Agent 上下文。
 
     复用 MCPToolManager 的熔断、缓存、参数校验能力，
     保证回复中的 BMI/饮水量/心率等数值来自确定性工具而非模型编造。
     同时负责：BMI 算出后自动落盘历史记录；用户问趋势时读取摘要。
+    返回 (注入文本, 已执行工具名列表)——后者用于慢通道去重。
     """
     if _tool_manager is None:
-        return ""
+        return "", []
     from tools.health_calculators import health_calculators
 
     parts: List[str] = []
+    used: List[str] = []
 
     if health_calculators.should_trigger(message):
         try:
@@ -500,8 +563,9 @@ async def _build_health_tool_context(message: str, user_profile: Dict[str, Any],
                 {"text": message, "user_profile": user_profile or {}},
             )
             if result.success and isinstance(result.data, list) and result.data:
-                print(f"[FLOW]   ├─ [健康计算工具] 命中 {len(result.data)} 个工具: {[r['name'] for r in result.data]}")
+                print(f"[FLOW]   ├─ [健康计算工具·快通道] 命中 {len(result.data)} 个工具: {[r['name'] for r in result.data]}")
                 parts.append(health_calculators.format_for_prompt(result.data))
+                used.append("health_calculators")
 
                 # BMI 命中 → 自动写入 Redis 历史（记忆系统 ↔ 工具打通）
                 for item in result.data:
@@ -516,41 +580,60 @@ async def _build_health_tool_context(message: str, user_profile: Dict[str, Any],
     lowered = (message or "").lower()
     if any(kw in lowered for kw in ("趋势", "历史", "变化", "记录")) and ("bmi" in lowered or "体重" in lowered):
         try:
-            trend = await _tool_manager.call("bmi_trend_history", {"user_id": user_id or "u1001"})
+            trend = await _tool_manager.call("bmi_trend_history", {}, context={"user_id": user_id or "u1001"})
             if trend.success and isinstance(trend.data, dict):
-                print("[FLOW]   ├─ [BMI 趋势工具] 注入历史摘要")
+                print("[FLOW]   ├─ [BMI 趋势工具·快通道] 注入历史摘要")
                 parts.append(f"[BMI 历史趋势]\n{trend.data.get('summary_text', '')}")
+                used.append("bmi_trend_history")
         except Exception as ex:
             logger.warning(f"BMI 趋势工具调用失败: {ex}")
 
-    return "\n".join(p for p in parts if p)
+    return "\n".join(p for p in parts if p), used
 
 
-async def _build_env_context(message: str) -> str:
+async def _build_env_context(message: str, user_profile: Dict[str, Any] = None) -> tuple:
     """
-    外部环境工具：空气/天气/户外关键词触发，注入实时 AQI 与天气。
+    快通道：外部环境工具按空气/天气/户外关键词触发，注入实时 AQI 与天气。
 
     走真实外部 API（Open-Meteo），由 MCPToolManager 的超时、熔断、
     fallback 提供保护；降级时返回提示文本而非报错。
+    关键词未命中的长尾问法由慢通道（function calling）兜底。
+    城市兜底顺序：消息显式提及 → 用户档案常住城市 → 默认北京。
+    返回 (注入文本, 已执行工具名列表)。
     """
     if _tool_manager is None:
-        return ""
+        return "", []
     from tools import external_health
     if not external_health.should_trigger(message):
-        return ""
-    city = external_health.extract_city(message)
+        return "", []
+    profile_city = str((user_profile or {}).get("default_city") or "").strip()
+    city = external_health.extract_city(message, fallback=profile_city or external_health.DEFAULT_CITY)
     try:
         result = await _tool_manager.call("external_health_api", {"city": city})
         if not result.success or not isinstance(result.data, dict):
-            return ""
-        print(f"[FLOW]   ├─ [外部环境工具] city={city}, fallback={result.data.get('fallback', False)}, error={result.data.get('error') or result.error}")
-        return (
+            return "", []
+        print(f"[FLOW]   ├─ [外部环境工具·快通道] city={city}, fallback={result.data.get('fallback', False)}, error={result.data.get('error') or result.error}")
+        text = (
             f"[外部环境数据]\n{result.data.get('summary_text', '')}\n"
             "回答户外运动相关问题时请结合以上实时数据给出建议。"
         )
+        return text, ["external_health_api"]
     except Exception as ex:
         logger.warning(f"外部环境工具调用失败: {ex}")
-        return ""
+        return "", []
+
+
+def _decide_tools_allow(safety_high_risk: bool, tools_used: List[str]) -> Optional[List[str]]:
+    """
+    慢通道门控：按开关/安全等级/快通道结果计算给 Agent 的工具白名单。
+    返回 None 表示本次请求不启用 function calling。
+    注：白名单是候选集，最终还会按路由出的 Agent 类型二次过滤。
+    """
+    if not ENABLE_FUNCTION_CALLING or safety_high_risk:
+        return None
+    allow = [n for n in ("health_calculators", "bmi_trend_history", "external_health_api")
+             if n not in _INTERNAL_TOOLS and n not in tools_used]
+    return allow or None
 
 
 def _should_use_knowledge(message: str) -> bool:

@@ -41,11 +41,12 @@ def should_trigger(text: str) -> bool:
     return any(kw in (text or "").lower() for kw in TRIGGER_KEYWORDS)
 
 
-def extract_city(text: str) -> str:
+def extract_city(text: str, fallback: str = DEFAULT_CITY) -> str:
+    """从消息文本提取城市；未命中时返回 fallback（可传入用户档案的常住城市）。"""
     for city in CITIES:
         if city in (text or ""):
             return city
-    return DEFAULT_CITY
+    return fallback
 
 
 def _aqi_level(aqi: Optional[float]) -> Tuple[str, str]:

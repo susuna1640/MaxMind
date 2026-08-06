@@ -94,7 +94,8 @@ class MemoryManager:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        from mcp.tool_manager import build_llm_client  # 统一直连客户端，避开本机代理
+        self._client = build_llm_client(api_key, base_url)
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
@@ -168,7 +169,8 @@ class MemoryManager:
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
         prompt = f"""从以下健康咨询对话中提炼用户的健康档案信息，返回 JSON。
 只记录用户明确提到的信息，不要推测。对话:{text}
-返回格式: {{"basic": {{"年龄": "", "性别": "", "身高": "", "体重": ""}}, "health_concerns": ["关注的健康问题"], "chronic_conditions": ["慢性病/过敏史"], "health_goals": ["健康目标"], "lifestyle": ["作息/饮食/运动习惯"]}}
+返回格式: {{"basic": {{"年龄": "", "性别": "", "身高": "", "体重": ""}}, "default_city": "常住城市", "health_concerns": ["关注的健康问题"], "chronic_conditions": ["慢性病/过敏史"], "health_goals": ["健康目标"], "lifestyle": ["作息/饮食/运动习惯"]}}
+default_city 仅在用户明确表达常住/居住地（如"我在上海""我住北京"）时填写，查询某城市信息不算。
 空字段用空字符串或空列表表示。"""
         prompt = self._safe_text(prompt)
 
@@ -180,6 +182,13 @@ class MemoryManager:
             raw = resp.content[0].text
             s, e = raw.find("{"), raw.rfind("}") + 1
             profile_data = json.loads(raw[s:e])
+
+            # 合并旧档案的 default_city：本轮对话未提及常住城市时继承已有值，避免覆盖丢失
+            if not str(profile_data.get("default_city") or "").strip():
+                old_profile = await self._get_profile(user_id)
+                old_city = str(old_profile.get("default_city") or "").strip()
+                if old_city:
+                    profile_data["default_city"] = old_city
 
             doc_id = f"{user_id}_profile_{conv_id}"
             doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))

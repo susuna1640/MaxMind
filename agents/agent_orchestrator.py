@@ -17,16 +17,18 @@
   - Agent 置信度低或处理失败 → 降级到 HealthAgent 兜底
 """
 import asyncio
+import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from mcp.tool_manager import build_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,10 @@ class Request:
     intent:      Optional[IntentCategory] = None
     urgency:     Optional[UrgencyLevel]   = None
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    # 混合式工具调用的门控信息（由 /chat 层按意图+快通道结果计算）：
+    tools_allow: Optional[List[str]] = None   # 慢通道工具白名单，None/空 = 不启用 function calling
+    tools_used:  List[str] = field(default_factory=list)  # 快通道已执行的工具，避免重复调用
+    tool_context: Optional[Dict[str, Any]] = None  # 请求级上下文（user_id/档案），透传给工具 handler
 
 
 @dataclass
@@ -103,10 +109,15 @@ class BaseAgent:
     agent_type: AgentType
     system_prompt: str
 
-    def __init__(self, client: AsyncAnthropic, model: str, skill_manager: Optional[Any] = None):
+    MAX_TOOL_ROUNDS = 3   # function calling 循环上限，防止 LLM 反复调工具
+
+    def __init__(self, client: AsyncAnthropic, model: str, skill_manager: Optional[Any] = None,
+                 tool_manager: Optional[Any] = None):
         self._client = client
         self._model  = model
         self._skill_manager = skill_manager
+        self._tool_manager  = tool_manager   # MCPToolManager，供工具循环执行 tool_use
+        self._after_tool_call = None         # 工具执行后钩子（如 BMI 落盘），由 /chat 层注入
         self.stats   = AgentStats()
 
     async def handle(self, req: Request) -> AgentResponse:
@@ -154,18 +165,63 @@ class BaseAgent:
             print(f"[FLOW]   \u2502   \u2502   {line}")
         if len(system_prompt.split('\n')) > 5:
             print(f"[FLOW]   \u2502   \u2502   ... (共 {len(system_prompt.split(chr(10)))} 行)")
-        print(f"[FLOW]   \u2502   \u251c\u2500 [Messages] (共 {len(messages)} 条):")
+        print(f"[FLOW]   │   ├─ [Messages] (共 {len(messages)} 条):")
         for i, msg in enumerate(messages):
-            content_preview = msg['content'][:80].replace('\n', ' ')
-            print(f"[FLOW]   \u2502   \u2502   [{i+1}] {msg['role']}: {content_preview}...")
-
-        resp = await self._client.messages.create(
+            if isinstance(msg['content'], str):
+                content_preview = msg['content'][:80].replace('\n', ' ')
+            else:
+                content_preview = "(结构化内容)"
+            print(f"[FLOW]   │   │   [{i+1}] {msg['role']}: {content_preview}...")
+        
+        # 慢通道：白名单非空且工具管理器可用时，启用 function calling 循环
+        tools = None
+        if req.tools_allow and self._tool_manager is not None:
+            tools = self._tool_manager.to_llm_tools(names=req.tools_allow, exclude=set(req.tools_used))
+            if not tools:
+                tools = None
+        if tools:
+            print(f"[FLOW]   │   ├─ [Function Calling] 开放工具: {[t['name'] for t in tools]}")
+        
+        kwargs: Dict[str, Any] = dict(
             model=self._model,
             max_tokens=1024,
             system=system_prompt,
             messages=messages,
         )
-        result_text = resp.content[0].text
+        if tools:
+            kwargs["tools"] = tools
+        
+        resp = await self._client.messages.create(**kwargs)
+        
+        # 工具循环：stop_reason=tool_use → 执行工具 → 结果回传 → 再调 LLM
+        rounds = 0
+        while resp.stop_reason == "tool_use" and tools and rounds < self.MAX_TOOL_ROUNDS:
+            rounds += 1
+            tool_blocks = [b for b in resp.content if b.type == "tool_use"]
+            messages.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for block in tool_blocks:
+                print(f"[FLOW]   │   ├─ [工具调用·第{rounds}轮] {block.name}({json.dumps(block.input, ensure_ascii=False)})")
+                result = await self._tool_manager.call(block.name, block.input, req.tool_context)
+                payload = result.data if result.success else {"error": result.error or "工具调用失败"}
+                if result.success and self._after_tool_call is not None:
+                    try:
+                        self._after_tool_call(block.name, block.input, result.data)
+                    except Exception as hook_ex:
+                        logger.warning(f"工具后置钩子异常: {hook_ex}")
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": _clean(json.dumps(payload, ensure_ascii=False, default=str)),
+                    "is_error": not result.success,
+                })
+            messages.append({"role": "user", "content": tool_results})
+            # kwargs["messages"] 与 messages 是同一 list 引用，原地追加后直接重发
+            resp = await self._client.messages.create(**kwargs)
+        
+        result_text = "".join(b.text for b in resp.content if b.type == "text")
+        if not result_text:
+            result_text = resp.content[0].text if resp.content else "抱歉，暂时无法回答。"
         print(f"[FLOW]   \u2502   \u2514\u2500 [Agent LLM 返回] ({len(result_text)} 字):")
         for line in result_text.split('\n')[:4]:
             print(f"[FLOW]   \u2502       {line}")
@@ -255,14 +311,14 @@ class AgentOrchestrator:
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
         skill_manager: Optional[Any] = None,
+        agent_tools_map: Optional[Dict[str, List[str]]] = None,
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        client = build_llm_client(api_key, base_url)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
         self._skill_manager = skill_manager
+        # Agent 类型 → 工具白名单：慢通道的二次过滤（治理层）
+        self._agent_tools_map = agent_tools_map or {}
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -278,6 +334,12 @@ class AgentOrchestrator:
         for agents in self._pool.values():
             for agent in agents:
                 agent._skill_manager = skill_manager
+
+    def set_tool_manager(self, tool_manager: Optional[Any]) -> None:
+        """注入 MCPToolManager，启用 Agent 层 function calling 慢通道。"""
+        for agents in self._pool.values():
+            for agent in agents:
+                agent._tool_manager = tool_manager
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
@@ -424,6 +486,12 @@ class AgentOrchestrator:
                 content="服务暂时不可用，请稍后重试。",
                 success=False,
             )
+
+        # 慢通道二次过滤：按实际执行的 Agent 类型收紧工具白名单
+        # 用 replace 复制而非原地修改，避免并行协作时多 Agent 共享 req 相互污染
+        whitelist = self._agent_tools_map.get(agent_type.value)
+        if req.tools_allow is not None and whitelist is not None:
+            req = replace(req, tools_allow=[t for t in req.tools_allow if t in whitelist])
 
         response = await agent.handle(req)
 

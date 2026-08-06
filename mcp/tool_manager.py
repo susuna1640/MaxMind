@@ -17,11 +17,26 @@ import hashlib
 import json
 import logging
 import time
+
+import httpx
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
+
+
+def build_llm_client(api_key: str, base_url: Optional[str] = None) -> AsyncAnthropic:
+    """
+    统一构造 LLM 客户端：httpx 层 trust_env=False 直连，
+    不读 HTTP(S)_PROXY 环境变量——本机代理时断时续会让 LLM 调用报 Connection error。
+    项目内所有 AsyncAnthropic 构造都应走这里。
+    """
+    kwargs: Dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    kwargs["http_client"] = httpx.AsyncClient(trust_env=False)
+    return AsyncAnthropic(**kwargs)
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +147,7 @@ class MCPToolManager:
     """
 
     def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = build_llm_client(api_key, base_url)
         self._model  = model
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at)
@@ -148,6 +160,30 @@ class MCPToolManager:
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
+
+    def to_llm_tools(
+        self,
+        names: Optional[List[str]] = None,
+        exclude: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        导出 Anthropic function calling 格式的 tools 列表。
+
+        names:   白名单（None 表示全部工具）；exclude: 排除快通道已执行过的工具。
+        慢通道（LLM 自主决策）与快通道（关键词预触发）共用同一注册表，
+        避免一次请求里同一工具被调两遍。
+        """
+        exclude = exclude or set()
+        tools = []
+        for name, tool in self._tools.items():
+            if names is not None and name not in names:
+                continue
+            if name in exclude:
+                continue
+            schema = dict(tool.schema)
+            # Anthropic 格式要求 schema 字段名为 input_schema
+            tools.append({"name": tool.name, "description": tool.description, "input_schema": schema})
+        return tools
 
     # ── 核心调用 ──────────────────────────────────────────────────────────────
 

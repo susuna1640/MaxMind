@@ -234,7 +234,8 @@ class EndToEndEvaluator:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        from mcp.tool_manager import build_llm_client  # 统一直连客户端，避开本机代理
+        client = build_llm_client(api_key, base_url)
 
         self._orchestrator     = orchestrator
         self._judge            = LLMJudge(client, model)
