@@ -26,6 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
+from mcp.document_parser import DocumentParseError, SUPPORTED_BINARY_SUFFIXES, parse_document
+
 load_dotenv()
 
 logging.basicConfig(
@@ -50,6 +52,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_bmi_store    = None
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
@@ -68,7 +71,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _bmi_store
 
     print(BANNER, flush=True)
 
@@ -82,6 +85,8 @@ async def lifespan(app: FastAPI):
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
     from tools.health_calculators import health_calculators
+    from tools.health_history import BmiHistoryStore
+    from tools import external_health
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -197,6 +202,54 @@ async def lifespan(app: FastAPI):
             "required": ["text"],
         },
         cache_ttl=0.0,
+    ))
+
+    # BMI 历史趋势工具：Redis 存取按用户隔离的 BMI 记录（记忆系统 ↔ 工具打通）
+    _bmi_store = BmiHistoryStore(redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"))
+
+    async def bmi_trend_handler(params: Dict[str, Any], context: Optional[Dict[str, Any]]):
+        summary = _bmi_store.summarize(str(params.get("user_id") or "u1001"))
+        return summary or {
+            "record_count": 0,
+            "summary_text": "暂无 BMI 历史记录，可先说「身高170 体重70 算一下BMI」建立首条记录。",
+        }
+
+    _tool_manager.register(Tool(
+        name="bmi_trend_history",
+        description="BMI 历史趋势：读取 Redis 中用户的 BMI 记录并生成趋势摘要",
+        handler=bmi_trend_handler,
+        schema={
+            "type": "object",
+            "properties": {"user_id": {"type": "string"}},
+            "required": ["user_id"],
+        },
+        cache_ttl=0.0,
+    ))
+
+    # 外部环境健康工具：真实外部 API（Open-Meteo），展示熔断/超时/降级保护
+    async def env_health_handler(params: Dict[str, Any], context: Optional[Dict[str, Any]]):
+        report = await external_health.fetch_env_report(str(params.get("city") or external_health.DEFAULT_CITY))
+        report["summary_text"] = external_health.format_report(report)
+        return report
+
+    def env_health_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
+        city = str(params.get("city") or external_health.DEFAULT_CITY)
+        return {
+            "city": city, "fallback": True, "error": error,
+            "summary_text": f"{city}的实时空气与天气数据暂时无法获取（外部 API 不可用），户外活动请依据自身实际环境判断。",
+        }
+
+    _tool_manager.register(Tool(
+        name="external_health_api",
+        description="外部环境健康：实时空气质量与天气（Open-Meteo），给出户外活动建议",
+        handler=env_health_handler,
+        schema={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+        },
+        cache_ttl=300.0,
+        timeout_s=12.0,
+        fallback=env_health_fallback,
     ))
 
     # 性能监控（可选启动 Prometheus）
@@ -323,7 +376,8 @@ async def chat(req: ChatRequest):
     ] if mem_ctx.recent_messages else None
 
     knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
-    health_tool_text = await _build_health_tool_context(req.message, mem_ctx.user_profile)
+    health_tool_text = await _build_health_tool_context(req.message, mem_ctx.user_profile, req.user_id)
+    env_tool_text = await _build_env_context(req.message)
     context_parts = [mem_ctx.to_prompt_text()]
     if safety.is_high_risk:
         context_parts.append(
@@ -334,6 +388,8 @@ async def chat(req: ChatRequest):
         context_parts.append(knowledge_text)
     if health_tool_text:
         context_parts.append(health_tool_text)
+    if env_tool_text:
+        context_parts.append(env_tool_text)
     full_context = "\n\n".join(part for part in context_parts if part)
 
     orch_req = OrcReq(
@@ -423,29 +479,77 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
         return "", False
 
 
-async def _build_health_tool_context(message: str, user_profile: Dict[str, Any]) -> str:
+async def _build_health_tool_context(message: str, user_profile: Dict[str, Any], user_id: str = "") -> str:
     """
     方案 A：健康计算工具由 /chat 按关键词触发，结果注入 Agent 上下文。
 
     复用 MCPToolManager 的熔断、缓存、参数校验能力，
     保证回复中的 BMI/饮水量/心率等数值来自确定性工具而非模型编造。
+    同时负责：BMI 算出后自动落盘历史记录；用户问趋势时读取摘要。
     """
     if _tool_manager is None:
         return ""
     from tools.health_calculators import health_calculators
-    if not health_calculators.should_trigger(message):
+
+    parts: List[str] = []
+
+    if health_calculators.should_trigger(message):
+        try:
+            result = await _tool_manager.call(
+                "health_calculators",
+                {"text": message, "user_profile": user_profile or {}},
+            )
+            if result.success and isinstance(result.data, list) and result.data:
+                print(f"[FLOW]   ├─ [健康计算工具] 命中 {len(result.data)} 个工具: {[r['name'] for r in result.data]}")
+                parts.append(health_calculators.format_for_prompt(result.data))
+
+                # BMI 命中 → 自动写入 Redis 历史（记忆系统 ↔ 工具打通）
+                for item in result.data:
+                    if item.get("name") == "bmi_calculator" and user_id and _bmi_store is not None:
+                        d = item.get("data", {})
+                        if _bmi_store.record(user_id, d.get("height_cm", 0), d.get("weight_kg", 0), d.get("bmi", 0)):
+                            print(f"[FLOW]   ├─ [BMI 历史] 已为用户 {user_id} 落盘一条记录")
+        except Exception as ex:
+            logger.warning(f"健康计算工具调用失败: {ex}")
+
+    # 趋势问询触发：「我体重/BMI 最近变化怎么样」→ 读 Redis 历史生成摘要
+    lowered = (message or "").lower()
+    if any(kw in lowered for kw in ("趋势", "历史", "变化", "记录")) and ("bmi" in lowered or "体重" in lowered):
+        try:
+            trend = await _tool_manager.call("bmi_trend_history", {"user_id": user_id or "u1001"})
+            if trend.success and isinstance(trend.data, dict):
+                print("[FLOW]   ├─ [BMI 趋势工具] 注入历史摘要")
+                parts.append(f"[BMI 历史趋势]\n{trend.data.get('summary_text', '')}")
+        except Exception as ex:
+            logger.warning(f"BMI 趋势工具调用失败: {ex}")
+
+    return "\n".join(p for p in parts if p)
+
+
+async def _build_env_context(message: str) -> str:
+    """
+    外部环境工具：空气/天气/户外关键词触发，注入实时 AQI 与天气。
+
+    走真实外部 API（Open-Meteo），由 MCPToolManager 的超时、熔断、
+    fallback 提供保护；降级时返回提示文本而非报错。
+    """
+    if _tool_manager is None:
         return ""
+    from tools import external_health
+    if not external_health.should_trigger(message):
+        return ""
+    city = external_health.extract_city(message)
     try:
-        result = await _tool_manager.call(
-            "health_calculators",
-            {"text": message, "user_profile": user_profile or {}},
-        )
-        if not result.success or not isinstance(result.data, list) or not result.data:
+        result = await _tool_manager.call("external_health_api", {"city": city})
+        if not result.success or not isinstance(result.data, dict):
             return ""
-        print(f"[FLOW]   ├─ [健康计算工具] 命中 {len(result.data)} 个工具: {[r['name'] for r in result.data]}")
-        return health_calculators.format_for_prompt(result.data)
+        print(f"[FLOW]   ├─ [外部环境工具] city={city}, fallback={result.data.get('fallback', False)}, error={result.data.get('error') or result.error}")
+        return (
+            f"[外部环境数据]\n{result.data.get('summary_text', '')}\n"
+            "回答户外运动相关问题时请结合以上实时数据给出建议。"
+        )
     except Exception as ex:
-        logger.warning(f"健康计算工具调用失败: {ex}")
+        logger.warning(f"外部环境工具调用失败: {ex}")
         return ""
 
 
@@ -557,8 +661,11 @@ async def upload_knowledge(file: UploadFile = File(...)):
     支持格式：
     - `.txt` / `.md`：整个文件作为一篇文档，文件名作为标题
     - `.json`：JSON 数组格式 `[{"title": "...", "content": "..."}, ...]`
+    - `.pdf`：pdfplumber 逐页抽取文本（扫描件/加密件不支持）
+    - `.docx`：抽取段落与表格文本
+    - `.html` / `.htm`：剥离标签取正文，优先用 <title> 作为标题
 
-    文件大小限制：10MB
+    所有格式均自动按 500 字切块入库。文件大小限制：10MB
     """
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
@@ -569,11 +676,19 @@ async def upload_knowledge(file: UploadFile = File(...)):
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件大小超过 10MB 限制")
 
-    text = content.decode("utf-8", errors="ignore")
     filename = file.filename or "unknown"
+    suffix = filename.lower()
+    suffix = suffix[suffix.rfind("."):] if "." in suffix else ""
 
-    if filename.endswith(".json"):
+    if suffix in SUPPORTED_BINARY_SUFFIXES:
+        # pdf / docx / html：走文档解析器提取纯文本
+        try:
+            docs = parse_document(filename, content)
+        except DocumentParseError as ex:
+            raise HTTPException(400, str(ex))
+    elif filename.endswith(".json"):
         import json as _json
+        text = content.decode("utf-8", errors="ignore")
         try:
             docs = _json.loads(text)
             if not isinstance(docs, list):
@@ -582,6 +697,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
             raise HTTPException(400, f"JSON 解析失败: {e}")
     else:
         # txt / md：整个文件作为一篇文档
+        text = content.decode("utf-8", errors="ignore")
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
 
@@ -601,6 +717,50 @@ async def knowledge_stats():
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
     return {"total_chunks": kb.doc_count}
+
+
+@app.get("/knowledge/list", tags=["知识库"])
+async def knowledge_list():
+    """按文档分组列出知识库全部切片，用于直观查看离线建库结果。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    data = kb._collection.get(include=["documents", "metadatas"])
+
+    docs: Dict[str, Any] = {}
+    for cid, doc, meta in zip(data["ids"], data["documents"], data["metadatas"]):
+        title = (meta or {}).get("title", "未命名")
+        entry = docs.setdefault(title, {
+            "title": title,
+            "total_chunks": (meta or {}).get("total_chunks", 1),
+            "chunks": [],
+        })
+        entry["chunks"].append({
+            "id": cid,
+            "chunk_index": (meta or {}).get("chunk_index", 0),
+            "chars": len(doc or ""),
+            "content": doc,
+        })
+
+    for entry in docs.values():
+        entry["chunks"].sort(key=lambda c: c["chunk_index"])
+    result = sorted(docs.values(), key=lambda d: d["title"])
+    return {"total_chunks": kb.doc_count, "total_documents": len(result), "documents": result}
+
+
+@app.delete("/knowledge/doc/{title}", tags=["知识库"])
+async def knowledge_delete_doc(title: str):
+    """按标题删除一篇文档的全部切片（方便反复测试建库）。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    data = kb._collection.get(where={"title": title}, include=[])
+    if not data["ids"]:
+        raise HTTPException(404, f"未找到标题为「{title}」的文档")
+    kb._collection.delete(ids=data["ids"])
+    return {"message": f"已删除「{title}」的 {len(data['ids'])} 个切片", "total_chunks": kb.doc_count}
 
 
 @app.post("/eval/run")

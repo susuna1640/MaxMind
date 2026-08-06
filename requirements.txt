@@ -17,7 +17,15 @@ chromadb==0.5.23           # 向量数据库（长期记忆）
 prometheus-client==0.21.1
 
 # ── HTTP 客户端 ───────────────────────────────────────────────────────────────
-httpx==0.28.1              # monitor/performance_monitor.py webhook 告警
+httpx==0.28.1              # monitor webhook 告警；tools/external_health.py 外部 API 调用
 
 # ── 工具 ──────────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
+
+# ── MCP 标准协议（mcp_server.py 以 stdio 导出健康工具）─────────────────────
+mcp>=1.2,<1.10             # 官方 MCP SDK（FastMCP）；勿升 2.x：要求 starlette>=1.4，与 fastapi 0.115 冲突
+
+# ── 文档解析（RAG 离线构造：/knowledge/upload 支持 pdf/docx/html）──────────────────────
+pdfplumber==0.11.4         # PDF 文本抽取
+python-docx==1.1.2         # DOCX 段落/表格抽取
+beautifulsoup4==4.12.3     # HTML 正文提取
