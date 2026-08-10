@@ -846,6 +846,74 @@ async def knowledge_delete_doc(title: str):
     return {"message": f"已删除「{title}」的 {len(data['ids'])} 个切片", "total_chunks": kb.doc_count}
 
 
+@app.get("/memory/users", tags=["记忆"])
+async def memory_users():
+    """枚举所有有记忆痕迹的用户（工作记忆/情景记忆/档案），供记忆可视化页面。"""
+    if _memory is None:
+        raise HTTPException(503, "记忆系统未初始化")
+
+    def _entry(uid: str) -> Dict[str, Any]:
+        return users.setdefault(uid, {"user_id": uid, "has_profile": False,
+                                      "episodic_count": 0, "conv_count": 0})
+
+    users: Dict[str, Dict[str, Any]] = {}
+    # 工作记忆（Redis）：键格式 wm:{user_id}:{conv_id}
+    for key in _memory._redis.scan_iter(match="wm:*", count=200):
+        parts = key.split(":", 2)
+        if len(parts) == 3:
+            _entry(parts[1])["conv_count"] += 1
+    # 情景记忆（ChromaDB）
+    for meta in _memory._episodic.get(include=["metadatas"])["metadatas"]:
+        uid = (meta or {}).get("user_id")
+        if uid:
+            _entry(uid)["episodic_count"] += 1
+    # 用户档案（ChromaDB）
+    for meta in _memory._profile.get(include=["metadatas"])["metadatas"]:
+        uid = (meta or {}).get("user_id")
+        if uid:
+            _entry(uid)["has_profile"] = True
+
+    return {"total_users": len(users),
+            "users": sorted(users.values(), key=lambda u: u["user_id"])}
+
+
+@app.get("/memory/{user_id}", tags=["记忆"])
+async def memory_detail(user_id: str, limit: int = 50):
+    """查看单个用户的三级记忆：工作记忆（按会话分组）、情景记忆、用户健康档案。"""
+    if _memory is None:
+        raise HTTPException(503, "记忆系统未初始化")
+
+    # 1. 工作记忆（Redis）：遍历该用户所有会话
+    convs: List[Dict[str, Any]] = []
+    for key in _memory._redis.scan_iter(match=f"wm:{user_id}:*", count=200):
+        conv_id = key.split(":", 2)[2]
+        msgs = await _memory._get_working_memory(user_id, conv_id)
+        convs.append({
+            "conv_id": conv_id,
+            "summary": _memory._redis.get(_memory._summary_key(user_id, conv_id)) or "",
+            "messages": [{"role": m.role.value, "content": m.content,
+                          "ts": m.timestamp.isoformat()} for m in msgs],
+        })
+    convs.sort(key=lambda c: c["messages"][-1]["ts"] if c["messages"] else "", reverse=True)
+
+    # 2. 情景记忆（ChromaDB）：压缩时沉淀的跨会话历史
+    data = _memory._episodic.get(where={"user_id": user_id}, include=["documents", "metadatas"])
+    episodic = []
+    for doc, meta in zip(data["documents"], data["metadatas"]):
+        meta = meta or {}
+        episodic.append({
+            "ts": meta.get("ts", ""), "conv_id": meta.get("conv_id", ""),
+            "summary": doc or "", "full_text": meta.get("full_text", ""),
+        })
+    episodic.sort(key=lambda e: e["ts"], reverse=True)
+
+    # 3. 用户健康档案（取最新一条，与对话链路一致）
+    profile = await _memory._get_profile(user_id)
+
+    return {"user_id": user_id, "profile": profile,
+            "working": convs, "episodic": episodic[:limit]}
+
+
 @app.post("/eval/run")
 async def run_eval(body: Optional[EvalRunInput] = None):
     """运行内置评测用例，返回评测报告。"""
@@ -961,6 +1029,7 @@ if __name__ == "__main__":
         uvicorn.run(
             "api.main:app",
             host=os.getenv("API_HOST", "0.0.0.0"),
-            port=int(os.getenv("API_PORT", "8000")),
+            # 默认 8002：8000 常被 IDE 预览服务抢占（127.0.0.1 精确绑定优先），导致请求黑洞
+            port=int(os.getenv("API_PORT", "8002")),
             reload=os.getenv("APP_ENV") == "development",
         )
