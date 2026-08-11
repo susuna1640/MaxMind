@@ -54,3 +54,4 @@ class TestContextFiltering:
         # 症状自述即使带问号也必须拦截，宁多拦不漏检
         assert detect_red_flags("我胸痛得厉害，是怎么回事？要不要去医院").is_high_risk
         assert detect_red_flags("最近没有运动，胸口闷闷的").is_high_risk
+        assert detect_red_flags("胸口有点闷但还能正常说话，我想先做个呼吸练习").is_high_risk

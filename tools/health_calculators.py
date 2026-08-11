@@ -67,7 +67,7 @@ class HealthCalculators:
         text = (text or "").lower()
         keywords = (
             "bmi", "体重指数", "身高", "体重",
-            "喝水", "饮水", "补水", "水量", "多少水",
+            "喝水", "饮水", "补水", "水量", "多少水", "升水", "毫升水",
             "几点睡", "几点起", "起床", "入睡", "作息",
             "运动心率", "有氧", "燃脂", "快走", "跑步",
             "基础代谢", "代谢", "tdee", "消耗热量", "热量缺口",
@@ -149,7 +149,7 @@ class HealthCalculators:
         )
 
     def _maybe_calculate_water(self, text: str) -> Optional[HealthToolResult]:
-        if not any(kw in text for kw in ("喝水", "饮水", "补水", "水量", "多少水", "喝多少")):
+        if not any(kw in text for kw in ("喝水", "饮水", "补水", "水量", "多少水", "喝多少", "升水", "毫升水")):
             return None
 
         weight_kg = self._extract_weight_kg(text)

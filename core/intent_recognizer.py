@@ -65,7 +65,7 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
 # 紧急关键词：CRITICAL 由红旗症状（危险信号）承担，命中即触发就医预警。
 # 与 core/safety_checker.py 的口语化词表保持同步。
 _URGENCY_KEYWORDS = {
-    UrgencyLevel.CRITICAL: ["胸痛", "胸闷", "胸口闷", "胸口疼", "呼吸困难", "喘不上气",
+    UrgencyLevel.CRITICAL: ["胸痛", "胸闷", "胸口闷", "胸口闷闷", "胸口有点闷", "胸口疼", "呼吸困难", "喘不上气",
                             "昏迷", "抽搐", "大出血", "吐血", "咯血", "黑便", "剧烈头痛",
                             "偏瘫", "半边身子", "高烧不退", "意识模糊", "休克", "晕倒",
                             "眼前一黑", "血流不止"],

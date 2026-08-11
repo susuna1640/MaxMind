@@ -120,7 +120,13 @@ class TestExtractionAndTrigger:
     def test_should_trigger_keywords(self, calc):
         assert calc.should_trigger("帮我算BMI")
         assert calc.should_trigger("每天喝多少水")
+        assert calc.should_trigger("每天喝2升水够不够")
         assert not calc.should_trigger("养肝吃什么好")
+
+    def test_run_tools_water_from_liter_expression(self, calc):
+        results = calc.run_tools("我70公斤，每天喝2升水够不够")
+        water_result = next(r for r in results if r["name"] == "water_intake_estimator")
+        assert water_result["data"]["daily_water_ml_low"] == 2100
 
     def test_format_for_prompt(self, calc):
         results = calc.run_tools("身高170体重70算BMI")
