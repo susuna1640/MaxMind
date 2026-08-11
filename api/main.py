@@ -58,10 +58,14 @@ _bmi_store    = None
 # function calling 总开关：关闭后回退纯关键词快通道（降级开关）
 ENABLE_FUNCTION_CALLING = os.getenv("ENABLE_FUNCTION_CALLING", "1") not in ("0", "false", "False")
 # 按 Agent 类型的工具白名单：编排层治理“哪些工具对哪个 Agent 开放”
+_WATCH_TOOLS = [
+    "watch_health_open_session", "watch_get_latest_health",
+    "watch_get_health_history", "watch_measure_now",
+]
 AGENT_TOOL_WHITELIST: Dict[str, List[str]] = {
-    "health":     ["health_calculators", "bmi_trend_history", "external_health_api"],
+    "health":     ["health_calculators", "bmi_trend_history", "external_health_api"] + _WATCH_TOOLS,
     "nutrition":  ["health_calculators", "bmi_trend_history"],
-    "fitness":    ["health_calculators", "bmi_trend_history", "external_health_api"],
+    "fitness":    ["health_calculators", "bmi_trend_history", "external_health_api"] + _WATCH_TOOLS,
     "escalation": [],   # 就医预警场景不给工具，避免延误就医
 }
 # 不开放给 LLM 自主调用的工具：knowledge_search 已由 RAG 链路注入；detect_red_flags 在 /chat 前置执行
@@ -102,6 +106,7 @@ async def lifespan(app: FastAPI):
     from tools.health_calculators import health_calculators
     from tools.health_history import BmiHistoryStore
     from tools import external_health
+    from tools.watch_health import register_watch_tools
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -288,6 +293,9 @@ async def lifespan(app: FastAPI):
         timeout_s=12.0,
         fallback=env_health_fallback,
     ))
+
+    # Apple Watch 远程 MCP 工具（未配置 WATCH_MCP_PATH_TOKEN 时自动跳过）
+    register_watch_tools(_tool_manager)
 
     # 慢通道接线：把工具管理器注入编排器，Agent 层启用 function calling
     _orchestrator.set_tool_manager(_tool_manager)
@@ -632,6 +640,7 @@ def _decide_tools_allow(safety_high_risk: bool, tools_used: List[str]) -> Option
     if not ENABLE_FUNCTION_CALLING or safety_high_risk:
         return None
     allow = [n for n in ("health_calculators", "bmi_trend_history", "external_health_api")
+             + tuple(_WATCH_TOOLS)
              if n not in _INTERNAL_TOOLS and n not in tools_used]
     return allow or None
 
@@ -706,9 +715,10 @@ class EvalDialogInput(BaseModel):
 
 
 class EvalRunInput(BaseModel):
-    """评测请求。为空时使用内置默认用例。"""
+    """评测请求。为空时优先加载外置评测套件（EVAL_SUITE_PATH），否则用内置默认用例。"""
     intent_cases: Optional[List[EvalIntentInput]] = None
     dialog_cases: Optional[List[EvalDialogInput]] = None
+    use_full_suite: bool = True   # 空 body 时是否加载扩展套件（含安全/工具维度）
 
 
 @app.post("/knowledge/add", tags=["知识库"])
@@ -916,11 +926,14 @@ async def memory_detail(user_id: str, limit: int = 50):
 
 @app.post("/eval/run")
 async def run_eval(body: Optional[EvalRunInput] = None):
-    """运行内置评测用例，返回评测报告。"""
+    """运行评测用例，返回评测报告。空 body 默认加载扩展评测套件（意图+安全+工具+对话）。"""
     if _evaluator is None:
         raise HTTPException(503, "服务未就绪")
-    from evaluation.evaluator import DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase
+    from evaluation.evaluator import (
+        DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase, load_eval_suite,
+    )
 
+    safety_cases, tool_cases = None, None
     if body and body.intent_cases is not None:
         intent_cases = [
             IntentTestCase(
@@ -930,20 +943,25 @@ async def run_eval(body: Optional[EvalRunInput] = None):
             )
             for c in body.intent_cases
         ]
-    else:
-        intent_cases = DEFAULT_INTENT_CASES
-
-    if body and body.dialog_cases is not None:
         dialog_cases = [
             c.model_dump(exclude_none=True)
-            for c in body.dialog_cases
-        ]
+            for c in (body.dialog_cases or [])
+        ] or None
     else:
-        dialog_cases = DEFAULT_DIALOG_CASES
+        # 优先加载外置扩展评测套件
+        suite = {}
+        if (not body or body.use_full_suite):
+            suite = load_eval_suite(os.getenv("EVAL_SUITE_PATH", "./data/eval/eval_suite.json"))
+        intent_cases = suite.get("intent_cases") or DEFAULT_INTENT_CASES
+        dialog_cases = suite.get("dialog_cases") or DEFAULT_DIALOG_CASES
+        safety_cases = suite.get("safety_cases") or None
+        tool_cases   = suite.get("tool_cases") or None
 
     report = await _evaluator.run(
         intent_cases=intent_cases,
         dialog_cases=dialog_cases,
+        safety_cases=safety_cases,
+        tool_cases=tool_cases,
     )
     return {
         "pass_rate":       report.pass_rate,

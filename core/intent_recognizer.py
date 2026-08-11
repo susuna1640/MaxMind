@@ -62,10 +62,13 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
 }
 
-# 紧急关键词：CRITICAL 由红旗症状（危险信号）承担，命中即触发就医预警
+# 紧急关键词：CRITICAL 由红旗症状（危险信号）承担，命中即触发就医预警。
+# 与 core/safety_checker.py 的口语化词表保持同步。
 _URGENCY_KEYWORDS = {
-    UrgencyLevel.CRITICAL: ["胸痛", "胸闷", "呼吸困难", "昏迷", "抽搐", "大出血", "吐血",
-                            "咯血", "黑便", "剧烈头痛", "偏瘫", "高烧不退", "意识模糊", "休克"],
+    UrgencyLevel.CRITICAL: ["胸痛", "胸闷", "胸口闷", "胸口疼", "呼吸困难", "喘不上气",
+                            "昏迷", "抽搐", "大出血", "吐血", "咯血", "黑便", "剧烈头痛",
+                            "偏瘫", "半边身子", "高烧不退", "意识模糊", "休克", "晕倒",
+                            "眼前一黑", "血流不止"],
     UrgencyLevel.HIGH:     ["紧急", "emergency", "urgent", "asap", "立刻", "马上就医"],
     UrgencyLevel.MEDIUM:   ["今天", "马上", "尽快", "hurry", "now"],
 }
@@ -133,24 +136,25 @@ class IntentRecognizer:
 
         t0 = time.monotonic()
 
-        # LLM 和 Embedding 并行（Embedding 不可用时跳过）
+        # LLM、Embedding、实体提取三者并行，不串行等待
+        # （实体提取提前并行是延迟优化的关键：省掉一次串行 LLM 往返）
         llm_task = asyncio.create_task(self._llm_recognize(message, history))
         emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
+        ent_task = asyncio.create_task(self._extract_entities(message))
         pat      = self._pattern_recognize(message)
-
+        
         if emb_task:
-            llm, emb = await asyncio.gather(llm_task, emb_task)
+            llm, emb, entities = await asyncio.gather(llm_task, emb_task, ent_task)
         else:
-            llm = await llm_task
+            llm, entities = await asyncio.gather(llm_task, ent_task)
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
-
+        
         # ★ 三路结果投票合并
-        print(f"[FLOW]   \u251c\u2500 三路结果:")
-        print(f"[FLOW]   \u2502   LLM:     {llm.get('intent', 'OTHER')} (置信度 {llm.get('confidence', 0):.2f})")
-        print(f"[FLOW]   \u2502   Embedding: {emb.get('intent', 'OTHER')} (置信度 {emb.get('confidence', 0):.2f})")
-        print(f"[FLOW]   \u2502   Pattern:   {pat.get('intent', 'OTHER')} (置信度 {pat.get('confidence', 0):.2f})")
+        print(f"[FLOW]   ├─ 三路结果:")
+        print(f"[FLOW]   │   LLM:     {llm.get('intent', 'OTHER')} (置信度 {llm.get('confidence', 0):.2f})")
+        print(f"[FLOW]   │   Embedding: {emb.get('intent', 'OTHER')} (置信度 {emb.get('confidence', 0):.2f})")
+        print(f"[FLOW]   │   Pattern:   {pat.get('intent', 'OTHER')} (置信度 {pat.get('confidence', 0):.2f})")
         intent = self._vote(llm, emb, pat)
-        entities = await self._extract_entities(message)
         urgency  = self._urgency(message, intent)
         print(f"[FLOW]   \u2514\u2500 投票结果: intent={intent.value}, urgency={urgency.name}, 耗时 {(time.monotonic()-t0)*1000:.0f}ms")
 
@@ -202,6 +206,17 @@ class IntentRecognizer:
             )
 
         prompt = f"""你是健康管理意图分析专家。根据示例判断用户意图，返回 JSON。
+
+意图定义:
+- consult: 一般健康咨询（症状调理、体质、疲劳、脱发等非急症问题）
+- nutrition: 饮食/营养（吃什么、食谱、忌口、食疗）
+- fitness: 运动/睡眠（锻炼计划、失眠调理、作息习惯）
+- calculate: 需要算出数值的问题（BMI、饮水量、运动心率区间、入睡时间点、基础代谢）；
+  只要问题本质是“算一个数值”，即使涉及饮食或运动也归此类
+- profile: 记录/更新个人健康档案
+- escalation: 急症/危险信号（胸痛、晕倒、大出血等）
+- greeting: 问候
+- other: 与健康无关
 
 示例:
 {examples}
