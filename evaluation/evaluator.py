@@ -235,13 +235,55 @@ class SafetyEvaluator:
       - false_positive_rate：正常消息被误判为急症的比例（误报损害体验）
     """
 
+    def __init__(self, classifier: Optional[Any] = None):
+        self._classifier = classifier
+
+    async def evaluate_async(self, cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if self._classifier is None:
+            return self.evaluate(cases)
+        return await self._evaluate(cases, use_classifier=True)
+
     def evaluate(self, cases: List[Dict[str, Any]]) -> Dict[str, Any]:
         from core.safety_checker import detect_red_flags
 
         must, no_esc_total, no_esc_fp, case_details = [], 0, 0, []
         for case in cases:
             message, category = case["message"], case.get("category", "must_escalate")
-            escalated = detect_red_flags(message).is_high_risk
+            result = detect_red_flags(message)
+            escalated = result.is_high_risk
+            expected  = category == "must_escalate"
+            ok = escalated == expected
+            if expected:
+                must.append(ok)
+            else:
+                no_esc_total += 1
+                if escalated:
+                    no_esc_fp += 1
+            case_details.append({
+                "message": message, "category": category,
+                "escalated": escalated, "expected": expected, "ok": ok,
+                "note": case.get("note", ""),
+                "action": result.action,
+                "source": result.source,
+                "reason": result.reason,
+            })
+
+        return {
+            "safety_recall":        round(sum(must) / len(must), 4) if must else 1.0,
+            "false_positive_rate":  round(no_esc_fp / no_esc_total, 4) if no_esc_total else 0.0,
+            "missed":    [c["message"] for c in case_details if c["expected"] and not c["ok"]],
+            "false_pos": [c["message"] for c in case_details if not c["expected"] and not c["ok"]],
+            "cases":     case_details,
+        }
+
+    async def _evaluate(self, cases: List[Dict[str, Any]], use_classifier: bool) -> Dict[str, Any]:
+        from core.safety_checker import detect_red_flags
+
+        must, no_esc_total, no_esc_fp, case_details = [], 0, 0, []
+        for case in cases:
+            message, category = case["message"], case.get("category", "must_escalate")
+            result = await self._classifier.classify(message) if use_classifier else detect_red_flags(message)
+            escalated = result.is_high_risk
             expected  = category == "must_escalate"
             ok = escalated == expected
             if expected:
@@ -254,6 +296,9 @@ class SafetyEvaluator:
                 "message": message, "category": category,
                 "escalated": escalated, "expected": expected, "ok": ok,
                 "note": case.get("note", ""),
+                "action": getattr(result, "action", "must_escalate" if escalated else "no_escalate"),
+                "source": getattr(result, "source", "rule"),
+                "reason": getattr(result, "reason", ""),
             })
 
         return {
@@ -390,7 +435,7 @@ class EndToEndEvaluator:
         # 1.5 安全拦截评测（离线，无 LLM 开销）
         safety_metrics: Dict[str, Any] = {}
         if safety_cases:
-            safety_metrics = self._safety_evaluator.evaluate(safety_cases)
+            safety_metrics = await self._safety_evaluator.evaluate_async(safety_cases)
             results.append(EvalResult(
                 test_id="safety_red_flag",
                 passed=safety_metrics["safety_recall"] >= 1.0,

@@ -345,11 +345,11 @@ class AgentOrchestrator:
 
     async def run(self, req: Request) -> OrchestratorResult:
         """
-        处理一次请求的完整流程：
+        处理一次编排请求的内部流程：
           意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
         """
         # ★ 编排器主入口
-        print(f"[FLOW] Step 2/4: 编排器收到请求: \"{req.message}\"")
+        print(f"[FLOW]   ├─ [编排器] 收到请求: \"{req.message}\"")
         t0 = time.monotonic()
 
         # 1. 意图识别（如果调用方已识别则跳过）
@@ -392,7 +392,7 @@ class AgentOrchestrator:
     async def run_parallel(self, req: Request, agent_types: List[AgentType]) -> OrchestratorResult:
         """
         并行派发给多个 Agent，合并结果。
-        适用于复杂问题（如同时涉及技术和账单）。
+        适用于复杂健康问题（如同时涉及饮食和运动）。
         """
         t0 = time.monotonic()
         tasks = [self._execute(req, at) for at in agent_types]

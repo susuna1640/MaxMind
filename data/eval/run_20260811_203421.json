@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-08-11T20:34:21.427640",
+  "metrics": {
+    "safety_recall": 1.0,
+    "safety_false_positive_rate": 0.0,
+    "tool_trigger_accuracy": 1.0,
+    "tool_value_accuracy": 1.0
+  },
+  "details": {
+    "safety": {
+      "safety_recall": 1.0,
+      "false_positive_rate": 0.0,
+      "missed": [],
+      "false_pos": []
+    },
+    "tool": {
+      "trigger_accuracy": 1.0,
+      "value_accuracy": 1.0
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "timestamp": "2026-08-10T21:22:20.348257",
+  "metrics": {
+    "safety_recall": 1.0,
+    "safety_false_positive_rate": 0.0,
+    "tool_trigger_accuracy": 1.0,
+    "tool_value_accuracy": 1.0,
+    "intent_accuracy": 1.0,
+    "intent_macro_f1": 1.0,
+    "intent_latency_p50_ms": 1389.9,
+    "intent_latency_p95_ms": 1639.4
+  },
+  "details": {
+    "safety": {
+      "safety_recall": 1.0,
+      "false_positive_rate": 0.0,
+      "missed": [],
+      "false_pos": []
+    },
+    "tool": {
+      "trigger_accuracy": 1.0,
+      "value_accuracy": 1.0
+    },
+    "intent": {
+      "per_class": {
+        "calculate": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        },
+        "consult": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        },
+        "escalation": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        },
+        "fitness": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        },
+        "greeting": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        },
+        "nutrition": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        },
+        "other": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        },
+        "profile": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0
+        }
+      },
+      "wrong_cases": []
+    }
+  }
+}

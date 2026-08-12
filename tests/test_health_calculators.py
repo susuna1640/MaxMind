@@ -105,16 +105,19 @@ class TestExtractionAndTrigger:
     def test_height_unit_variants(self, calc):
         assert calc._extract_height_cm("身高175cm") == 175
         assert calc._extract_height_cm("身高1.75米") == 175.0
+        assert calc._extract_height_cm("身高1米7") == 170
         assert calc._extract_height_cm("身高170") == 170
 
     def test_weight_unit_variants(self, calc):
         assert calc._extract_weight_kg("体重70kg") == 70
         assert calc._extract_weight_kg("我70公斤") == 70
+        assert calc._extract_weight_kg("体重140斤") == 70
         assert calc._extract_weight_kg("体重70") == 70
 
     def test_time_extraction(self, calc):
         assert calc._extract_time("我早上6:30起床") == (6, 30)
         assert calc._extract_time("6点30起床") == (6, 30)
+        assert calc._extract_time("明早七点半起床") == (7, 30)
         assert calc._extract_time("没有时间") is None
 
     def test_should_trigger_keywords(self, calc):
@@ -127,6 +130,16 @@ class TestExtractionAndTrigger:
         results = calc.run_tools("我70公斤，每天喝2升水够不够")
         water_result = next(r for r in results if r["name"] == "water_intake_estimator")
         assert water_result["data"]["daily_water_ml_low"] == 2100
+
+    def test_hard_natural_language_tool_cases(self, calc):
+        bmi = calc.run_tools("我身高1米7，体重140斤，BMI是多少")
+        assert next(r for r in bmi if r["name"] == "bmi_calculator")["data"]["bmi"] == 24.2
+
+        sleep = calc.run_tools("明早七点半起床，今晚几点睡合适")
+        assert next(r for r in sleep if r["name"] == "sleep_schedule_planner")["data"]["bedtime_7_5h"] == "00:00"
+
+        heart_rate = calc.run_tools("我三十岁，运动心率多少比较合适")
+        assert next(r for r in heart_rate if r["name"] == "exercise_heart_rate_estimator")["data"]["target_low"] == 95
 
     def test_format_for_prompt(self, calc):
         results = calc.run_tools("身高170体重70算BMI")

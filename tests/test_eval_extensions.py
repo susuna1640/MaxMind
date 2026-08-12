@@ -44,10 +44,10 @@ class TestSafetyEvaluator:
         ev = SafetyEvaluator()
         # 词表未覆盖的急症表达仍会漏检（评测集需持续补充）
         metrics = ev.evaluate([
-            {"message": "孩子误吞了纽扣电池", "category": "must_escalate"},
+            {"message": "孩子把磁力珠吞下去了", "category": "must_escalate"},
         ])
         assert metrics["safety_recall"] == 0.0
-        assert metrics["missed"] == ["孩子误吞了纽扣电池"]
+        assert metrics["missed"] == ["孩子把磁力珠吞下去了"]
 
     def test_false_positive_tracked(self):
         ev = SafetyEvaluator()

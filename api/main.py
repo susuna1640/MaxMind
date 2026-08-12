@@ -53,6 +53,7 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _bmi_store    = None
+_safety_classifier = None
 
 # ── 混合式工具调用的慢通道配置 ───────────────────────────────────────────────────
 # function calling 总开关：关闭后回退纯关键词快通道（降级开关）
@@ -90,13 +91,13 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _bmi_store
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _bmi_store, _safety_classifier
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from core.intent_recognizer import IntentRecognizer
-    from core.safety_checker import detect_red_flags
+    from core.safety_checker import SafetyClassifier, detect_red_flags
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager, Tool
@@ -115,6 +116,11 @@ async def lifespan(app: FastAPI):
     recognizer = IntentRecognizer(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
+        model=cfg["model"],
+    )
+    from mcp.tool_manager import build_llm_client
+    _safety_classifier = SafetyClassifier(
+        client=build_llm_client(cfg["api_key"], cfg.get("base_url")),
         model=cfg["model"],
     )
 
@@ -335,6 +341,7 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
+    _evaluator._safety_evaluator = _evaluator._safety_evaluator.__class__(_safety_classifier)
 
     logger.info("HealthMind 已就绪")
     yield
@@ -408,7 +415,7 @@ async def reload_skills():
 async def chat(req: ChatRequest):
     """
     主对话接口。完整流程：
-      安全前置检查 → 记忆读取 → 健康计算/知识库注入 → Agent 路由执行 → 记忆写入
+      安全分流 → 记忆读取 → 上下文增强 → 编排执行 → 记忆写入 → 异步画像更新
     """
     print(f"\n{'='*60}")
     print(f"[FLOW] 收到请求: user={req.user_id}, message=\"{req.message}\"")
@@ -423,21 +430,29 @@ async def chat(req: ChatRequest):
 
     conv_id = req.conv_id or str(uuid.uuid4())
 
-    # 0. 安全前置检查：红旗症状命中则强制进入就医预警链路
-    safety = detect_red_flags(req.message)
+    # 1. 安全分流：红旗症状命中则强制进入就医预警链路
+    if _safety_classifier is not None:
+        safety = await _safety_classifier.classify(req.message)
+    else:
+        safety = detect_red_flags(req.message)
     if safety.is_high_risk:
-        print(f"[FLOW] Step 0/4: 红旗症状检测命中: {safety.matched_flags}")
+        print(f"[FLOW] Stage 1/6 安全分流: 红旗症状检测命中 {safety.matched_flags}")
+    elif safety.should_ask_clarifying:
+        print(f"[FLOW] Stage 1/6 安全分流: 红旗症状候选需追问 {safety.matched_flags}")
+    else:
+        print("[FLOW] Stage 1/6 安全分流: 未触发高风险")
 
-    # 1. 读取记忆上下文
-    print("[FLOW] Step 1/4: 读取三级记忆上下文...")
+    # 2. 读取记忆上下文
+    print("[FLOW] Stage 2/6 记忆读取: 读取三级记忆上下文...")
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
-    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
+    # 3. 构建增强上下文（含对话历史，用于意图识别上下文）
     history = [
         {"role": m.role.value, "content": m.content}
         for m in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
 
+    print("[FLOW] Stage 3/6 上下文增强: 构建知识库、工具和环境上下文...")
     knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
     health_tool_text, health_tools_used = await _build_health_tool_context(req.message, mem_ctx.user_profile, req.user_id)
     env_tool_text, env_tools_used = await _build_env_context(req.message, mem_ctx.user_profile)
@@ -447,6 +462,11 @@ async def chat(req: ChatRequest):
         context_parts.append(
             f"[安全提示] 检测到红旗症状: {', '.join(safety.matched_flags)}。"
             "请优先建议用户立即就医，不要给出可能延误就医的调理方案。"
+        )
+    elif safety.should_ask_clarifying:
+        context_parts.append(
+            f"[安全提示] 检测到需进一步确认的风险信号: {', '.join(safety.matched_flags)}。"
+            "请先追问症状是否正在发生、持续时间和严重程度；如伴随加重、呼吸困难、晕厥等情况，应建议及时就医。"
         )
     if knowledge_text:
         context_parts.append(knowledge_text)
@@ -473,8 +493,8 @@ async def chat(req: ChatRequest):
         orch_req.intent  = IntentCategory.ESCALATION
         orch_req.urgency = UrgencyLevel.CRITICAL
 
-    # 3. 执行（进入编排器：意图识别 → Agent 路由 → LLM 调用）
-    print(f"[FLOW] Step 3/4: 进入编排器...")
+    # 4. 执行（进入编排器：意图识别 → Agent 路由 → LLM 调用）
+    print(f"[FLOW] Stage 4/6 编排执行: 进入编排器...")
     print(f"[FLOW]   \u251c\u2500 [完整 Context] (发给 Agent 的背景信息):")
     if full_context:
         for line in full_context.split('\n')[:6]:
@@ -485,8 +505,8 @@ async def chat(req: ChatRequest):
         print(f"[FLOW]   \u2502   (空)")
     result = await _orchestrator.run(orch_req)
 
-    # 4. 写入记忆
-    print(f"[FLOW] Step 4/4: 写入记忆 (intent={result.intent.value}, agent={result.agent_type.value})")
+    # 5. 写入记忆
+    print(f"[FLOW] Stage 5/6 记忆写入: intent={result.intent.value}, agent={result.agent_type.value}")
     print(f"[FLOW]   \u251c\u2500 [Agent 最终回复]:")
     for line in result.response.split('\n')[:4]:
         print(f"[FLOW]   \u2502   {line}")
@@ -496,7 +516,8 @@ async def chat(req: ChatRequest):
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
     await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-    # 5. 异步更新用户画像（不阻塞响应）
+    # 6. 异步更新用户画像（不阻塞响应）
+    print("[FLOW] Stage 6/6 画像更新: 已提交异步更新任务")
     asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
 
     return ChatResponse(

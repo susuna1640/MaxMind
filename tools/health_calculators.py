@@ -67,7 +67,7 @@ class HealthCalculators:
         text = (text or "").lower()
         keywords = (
             "bmi", "体重指数", "身高", "体重",
-            "喝水", "饮水", "补水", "水量", "多少水", "升水", "毫升水",
+            "喝水", "饮水", "补水", "水量", "多少水", "升水", "毫升水", "l水",
             "几点睡", "几点起", "起床", "入睡", "作息",
             "运动心率", "有氧", "燃脂", "快走", "跑步",
             "基础代谢", "代谢", "tdee", "消耗热量", "热量缺口",
@@ -149,7 +149,7 @@ class HealthCalculators:
         )
 
     def _maybe_calculate_water(self, text: str) -> Optional[HealthToolResult]:
-        if not any(kw in text for kw in ("喝水", "饮水", "补水", "水量", "多少水", "喝多少", "升水", "毫升水")):
+        if not any(kw in text.lower() for kw in ("喝水", "饮水", "补水", "水量", "多少水", "喝多少", "升水", "毫升水", "l水")):
             return None
 
         weight_kg = self._extract_weight_kg(text)
@@ -267,30 +267,36 @@ class HealthCalculators:
             r"(\d+(?:\.\d+)?)\s*厘米",
             r"身高\s*(1\.\d{1,2})\s*米",
             r"(1\.\d{1,2})\s*m",
+            r"身高\s*(1)\s*米\s*(\d{1,2})",
             r"身高\s*[:：]?\s*(1[2-9]\d|2[0-2]\d)(?!\d)",  # 裸数字：身高170
         ]
         for pattern in patterns:
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if not match:
                 continue
+            if len(match.groups()) >= 2 and match.group(2):
+                cm_part = float(match.group(2))
+                return float(match.group(1)) * 100 + (cm_part * 10 if cm_part < 10 else cm_part)
             value = float(match.group(1))
             return value * 100 if value < 3 else value
         return None
 
     def _extract_weight_kg(self, text: str) -> Optional[float]:
         patterns = [
-            r"体重\s*(\d+(?:\.\d+)?)\s*kg",
-            r"体重\s*(\d+(?:\.\d+)?)\s*公斤",
-            r"体重\s*(\d+(?:\.\d+)?)\s*千克",
-            r"(\d+(?:\.\d+)?)\s*kg",
-            r"(\d+(?:\.\d+)?)\s*公斤",
-            r"(\d+(?:\.\d+)?)\s*千克",
-            r"体重\s*[:：]?\s*(\d{2,3}(?:\.\d+)?)(?!\d)",  # 裸数字：体重70
+            (r"体重\s*(\d+(?:\.\d+)?)\s*kg", 1.0),
+            (r"体重\s*(\d+(?:\.\d+)?)\s*公斤", 1.0),
+            (r"体重\s*(\d+(?:\.\d+)?)\s*千克", 1.0),
+            (r"(\d+(?:\.\d+)?)\s*kg", 1.0),
+            (r"(\d+(?:\.\d+)?)\s*公斤", 1.0),
+            (r"(\d+(?:\.\d+)?)\s*千克", 1.0),
+            (r"体重\s*(\d+(?:\.\d+)?)\s*斤", 0.5),
+            (r"(\d+(?:\.\d+)?)\s*斤", 0.5),
+            (r"体重\s*[:：]?\s*(\d{2,3}(?:\.\d+)?)(?!\d)", 1.0),  # 裸数字：体重70
         ]
-        for pattern in patterns:
+        for pattern, factor in patterns:
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if match:
-                return float(match.group(1))
+                return float(match.group(1)) * factor
         return None
 
     def _extract_sex(self, text: str) -> Optional[str]:
@@ -309,6 +315,9 @@ class HealthCalculators:
             match = re.search(pattern, text)
             if match:
                 return float(match.group(1))
+        chinese_age = re.search(r"([一二三四五六七八九十两]{1,4})\s*岁", text)
+        if chinese_age:
+            return self._parse_chinese_number(chinese_age.group(1))
         return None
 
     def _extract_time(self, text: str) -> Optional[tuple]:
@@ -324,7 +333,29 @@ class HealthCalculators:
             minute = int(match.group(2) or 0)
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 return hour, minute
+        chinese_time = re.search(r"([一二三四五六七八九十两]{1,3})\s*点\s*(半|[一二三四五六七八九十两]{1,3}分?)?", text)
+        if chinese_time:
+            hour = self._parse_chinese_number(chinese_time.group(1))
+            minute_text = chinese_time.group(2) or ""
+            minute = 30 if minute_text == "半" else self._parse_chinese_number(minute_text.rstrip("分") or "零")
+            if hour is not None and minute is not None and 0 <= hour <= 23 and 0 <= minute <= 59:
+                return int(hour), int(minute)
         return None
+
+    @staticmethod
+    def _parse_chinese_number(text: str) -> Optional[int]:
+        if not text:
+            return 0
+        digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                  "六": 6, "七": 7, "八": 8, "九": 9}
+        if text in digits:
+            return digits[text]
+        if "十" not in text:
+            return None
+        left, _, right = text.partition("十")
+        tens = digits.get(left, 1) if left else 1
+        ones = digits.get(right, 0) if right else 0
+        return tens * 10 + ones
 
     @staticmethod
     def _to_number(value: Any) -> Optional[float]:
